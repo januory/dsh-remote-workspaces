@@ -1,0 +1,38 @@
+{
+  "name": "remote-workspaces",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Open folders on remote hosts over SSH as DeepSeek Harness workspaces — a non-invasive DSH bundle.",
+  "license": "MIT",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./fs": "./src/fs-plugin.js",
+    "./client": "./src/client.js"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "test": "node test/unit-mirror-path.mjs"
+  },
+  "dependencies": {
+    "ssh2": "^1.17.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-api-remotes"
+      ],
+      "platform": "web"
+    }
+  }
+}

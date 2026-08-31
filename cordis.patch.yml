@@ -1,0 +1,17 @@
+# SSH remote workspace bundle layer.
+#
+# Phase 1 (current): mount the host half at the bare package name. It publishes
+# the optional `ctx.sshClient` transport service, and the package's
+# `dsh.client` manifest is discovered from this host entry automatically by the
+# client module registry — so the browser half (the "远程工作区" settings
+# section) needs no separate loader row.
+#
+# Phase 2 (later, verified separately): replace the base `fs-sandbox` provider
+# with `RoutingFileSystem` (route `ssh://…` cwds to the SFTP backend; ordinary
+# local paths keep working through its built-in local backend). That step is
+# NOT enabled here because it drops the local write sandbox until the routing
+# local half delegates through a sandboxing backend.
+
+- insert:
+    - id: remote-workspaces
+      name: 'remote-workspaces'
