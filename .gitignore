@@ -3,3 +3,6 @@ node_modules/
 # Transient artifacts
 *.log
 *.tmp
+
+# Local design docs (never committed)
+docs/
