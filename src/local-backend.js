@@ -12,6 +12,7 @@ import { readFile, readdir, rename, rm, stat, lstat, realpath, writeFile } from 
 import { isAbsolute, join, relative, resolve, dirname, basename, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { fsError } from './errors.js'
+import { writableRoots, isPathUnder } from './containment.js'
 
 function versionOf(st) {
   return `mtime:${Math.round(st.mtimeMs)}:size:${st.size}`
@@ -24,8 +25,9 @@ function typeOf(st) {
 }
 
 export class LocalBackend {
-  constructor({ cwd = process.cwd() } = {}) {
+  constructor({ cwd = process.cwd(), getPolicy } = {}) {
     this.cwd = cwd
+    this.getPolicy = getPolicy
   }
 
   async resolve(path, opts = {}) {
@@ -129,34 +131,40 @@ export class LocalBackend {
     }
   }
 
-  async writeText(target, content, expected) {
-    const existing = await this.stat(target)
+  async writeText(target, content, expected, signal, sandboxPolicy) {
+    const t = await this.checkedTarget(target, sandboxPolicy)
+    const existing = await this.stat(t)
     if (existing !== undefined && existing.type !== 'file') {
-      throw fsError('FS_NOT_REGULAR_FILE', `cannot write "${target.displayPath}": not a regular file`)
+      throw fsError('FS_NOT_REGULAR_FILE', `cannot write "${t.displayPath}": not a regular file`)
     }
     if (expected && expected.kind === 'createIfAbsent' && existing !== undefined) {
-      throw fsError('FS_NOT_OBSERVED', `cannot overwrite existing "${target.displayPath}" without reading it first`)
+      throw fsError('FS_NOT_OBSERVED', `cannot overwrite existing "${t.displayPath}" without reading it first`)
     }
     if (expected && expected.kind === 'replaceIfVersion') {
       if (existing === undefined || existing.version !== expected.version) {
-        throw fsError('FS_STALE_VERSION', `cannot write "${target.displayPath}": file changed since it was read`)
+        throw fsError('FS_STALE_VERSION', `cannot write "${t.displayPath}": file changed since it was read`)
       }
     }
-    await this.atomicWrite(target.targetKey, content)
-    const after = await this.stat(target)
-    return { operation: existing === undefined ? 'create' : 'update', version: after.version }
+    let before = null
+    if (existing !== undefined && existing.type === 'file') {
+      try { before = await this.readText(t) } catch { before = null }
+    }
+    await this.atomicWrite(t.targetKey, content)
+    const after = await this.stat(t)
+    return { operation: existing === undefined ? 'create' : 'update', version: after.version, before, after: content }
   }
 
-  async editText(target, edit, expected) {
-    const existing = await this.stat(target)
-    if (existing === undefined) throw fsError('FS_STALE_VERSION', `cannot edit "${target.displayPath}": file changed since it was read`)
-    if (existing.type !== 'file') throw fsError('FS_NOT_REGULAR_FILE', `cannot edit "${target.displayPath}": not a regular file`)
+  async editText(target, edit, expected, signal, sandboxPolicy) {
+    const t = await this.checkedTarget(target, sandboxPolicy)
+    const existing = await this.stat(t)
+    if (existing === undefined) throw fsError('FS_STALE_VERSION', `cannot edit "${t.displayPath}": file changed since it was read`)
+    if (existing.type !== 'file') throw fsError('FS_NOT_REGULAR_FILE', `cannot edit "${t.displayPath}": not a regular file`)
     if (expected && existing.version !== expected.version) {
-      throw fsError('FS_STALE_VERSION', `cannot edit "${target.displayPath}": file changed since it was read`)
+      throw fsError('FS_STALE_VERSION', `cannot edit "${t.displayPath}": file changed since it was read`)
     }
-    const content = await this.readText(target)
+    const content = await this.readText(t)
     const oldString = edit.oldString
-    if (!oldString) throw fsError('FS_EDIT_NOT_FOUND', `cannot edit "${target.displayPath}": old_string must be non-empty`)
+    if (!oldString) throw fsError('FS_EDIT_NOT_FOUND', `cannot edit "${t.displayPath}": old_string must be non-empty`)
     let matches = 0
     let offset = 0
     while (true) {
@@ -165,14 +173,40 @@ export class LocalBackend {
       matches += 1
       offset = found + oldString.length
     }
-    if (matches === 0) throw fsError('FS_EDIT_NOT_FOUND', `cannot edit "${target.displayPath}": old_string was not found`)
+    if (matches === 0) throw fsError('FS_EDIT_NOT_FOUND', `cannot edit "${t.displayPath}": old_string was not found`)
     if (!edit.replaceAll && matches !== 1) {
-      throw fsError('FS_AMBIGUOUS_EDIT', `cannot edit "${target.displayPath}": old_string matched ${matches} times`)
+      throw fsError('FS_AMBIGUOUS_EDIT', `cannot edit "${t.displayPath}": old_string matched ${matches} times`)
     }
     const next = edit.replaceAll ? content.split(oldString).join(edit.newString) : content.replace(oldString, edit.newString)
-    await this.atomicWrite(target.targetKey, next)
-    const after = await this.stat(target)
+    await this.atomicWrite(t.targetKey, next)
+    const after = await this.stat(t)
     return { version: after.version, before: content, after: next }
+  }
+
+  /**
+   * Enforce the per-call sandbox policy against `target` (mirrors the harness's
+   * `@deepseek-ai/dsh-fs-sandbox` fence). No policy service or
+   * `danger-full-access` → target unchanged; `read-only` → deny;
+   * `workspace-write` → re-canonicalize and require containment under a
+   * writable root.
+   */
+  async checkedTarget(target, sandboxPolicy) {
+    const policy = sandboxPolicy ?? this.getPolicy?.()?.resolve?.()
+    if (policy === undefined) return target
+    const { mode } = policy
+    if (mode === 'danger-full-access') return target
+    if (mode === 'read-only') {
+      throw fsError('FS_SANDBOX_DENIED', `cannot write "${target.displayPath}": file access denied under read-only mode`)
+    }
+    const fresh = await this.resolve(target.displayPath)
+    let contained = false
+    for (const root of writableRoots(policy)) {
+      if (await isPathUnder(fresh.targetKey, root)) { contained = true; break }
+    }
+    if (!contained) {
+      throw fsError('FS_SANDBOX_DENIED', `cannot write "${target.displayPath}": file access denied under workspace-write mode`)
+    }
+    return fresh
   }
 
   async atomicWrite(targetKey, content) {

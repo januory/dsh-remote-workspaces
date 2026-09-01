@@ -1,16 +1,24 @@
 # SSH remote workspace bundle layer.
 #
-# Phase 1 (current): mount the host half at the bare package name. It publishes
-# the optional `ctx.sshClient` transport service, and the package's
-# `dsh.client` manifest is discovered from this host entry automatically by the
-# client module registry — so the browser half (the "远程工作区" settings
-# section) needs no separate loader row.
-#
-# Phase 2 (later, verified separately): replace the base `fs-sandbox` provider
-# with `RoutingFileSystem` (route `ssh://…` cwds to the SFTP backend; ordinary
-# local paths keep working through its built-in local backend). That step is
-# NOT enabled here because it drops the local write sandbox until the routing
-# local half delegates through a sandboxing backend.
+# the host half (mounted at the bare package name) provides the routing
+# `ctx.fs` and `ctx.shell` in addition to `ctx.sshClient` and the
+# `remoteWorkspaces` Remote namespace. The base sandbox providers are disabled
+# here so the plugin's routing providers (local half sandboxed via
+# `ctx.sandboxPolicy`/`ctx.sandbox`/`ctx.subprocess`, remote half SFTP/ssh2)
+# register without a duplicate-service throw.
+
+- id: fs-sandbox
+  name: '@deepseek-ai/dsh-fs-sandbox'
+  disabled: true
+- id: bash-sandbox
+  name: '@deepseek-ai/dsh-bash-sandbox'
+  disabled: true
+- id: pwsh-sandbox
+  name: '@deepseek-ai/dsh-pwsh-sandbox'
+  disabled: true
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  disabled: true
 
 - insert:
     - id: remote-workspaces

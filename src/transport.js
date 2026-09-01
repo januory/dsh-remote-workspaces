@@ -12,6 +12,29 @@ export function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`
 }
 
+/** Bounded output collector: keeps the TAIL of a stream, flags truncation. */
+class CapCollector {
+  constructor(maxBytes) {
+    this.maxBytes = maxBytes
+    this.tail = ''
+    this.truncated = false
+  }
+
+  push(chunk) {
+    const piece = String(chunk)
+    if (this.tail.length + piece.length > this.maxBytes) {
+      this.truncated = true
+      this.tail = (this.tail + piece).slice(-this.maxBytes)
+    } else {
+      this.tail += piece
+    }
+  }
+
+  output() {
+    return { text: this.tail, truncated: this.truncated }
+  }
+}
+
 /** Expand a leading `~` in a path (system ssh did this for us; ssh2 does not). */
 function expandTilde(value) {
   if (typeof value !== 'string' || value.length === 0) return value
@@ -166,6 +189,65 @@ export class SshClient {
   }
 
   /**
+   * Run one remote command with the shell-executor contract: cwd, timeout,
+   * bounded (tail-kept) stdout/stderr, stdin, and an abort signal that closes
+   * the exec channel (SIGHUP on the remote). Resolves with exitCode/signal,
+   * timedOut/aborted first-cause, and `{ text, truncated }` outputs.
+   */
+  async execShell(command, { cwd, timeoutMs = 60000, stdoutMaxBytes = 64000, stderrMaxBytes = 64000, stdin, signal } = {}) {
+    const script = cwd ? `cd ${shellQuote(cwd)} || exit 1\n${command}` : command
+    return await new Promise((resolve) => {
+      const conn = new Client()
+      let settled = false
+      let timedOut = false
+      let timer
+      let stream
+      const finish = (result) => {
+        if (settled) return
+        settled = true
+        if (timer !== undefined) clearTimeout(timer)
+        try { conn.end() } catch {}
+        resolve(result)
+      }
+      const killRemote = () => {
+        try { if (stream) stream.close() } catch {}
+        try { conn.end() } catch {}
+      }
+      timer = setTimeout(() => { timedOut = true; killRemote() }, timeoutMs)
+      if (signal !== undefined) {
+        if (signal.aborted) killRemote()
+        else signal.addEventListener('abort', killRemote, { once: true })
+      }
+      conn.on('ready', () => {
+        conn.exec(script, (err, s) => {
+          if (err) { finish({ ok: false, error: err.message }); return }
+          stream = s
+          const out = new CapCollector(stdoutMaxBytes)
+          const errc = new CapCollector(stderrMaxBytes)
+          s.on('data', (d) => out.push(d))
+          s.stderr.on('data', (d) => errc.push(d))
+          s.on('close', (code) => {
+            const aborted = signal !== undefined && signal.aborted
+            finish({
+              ok: true,
+              exitCode: code,
+              signal: null,
+              timedOut: timedOut && !aborted,
+              aborted: aborted && !timedOut,
+              stdout: out.output(),
+              stderr: errc.output(),
+            })
+          })
+          if (stdin === undefined) s.end()
+          else s.end(String(stdin))
+        })
+      })
+      conn.on('error', (error) => finish({ ok: false, error: describeError(error) }))
+      try { conn.connect(this.connectConfig()) } catch (error) { finish({ ok: false, error: describeError(error) }) }
+    })
+  }
+
+  /**
    * Open an SFTP channel and resolve a promise-wrapped facade over it.
    * Resolves `{ conn, readdir, stat, readFile, writeFile, mkdir, unlink, realpath, end }`.
    */
@@ -298,5 +380,22 @@ export class SshClient {
 
   async remove(path) {
     return this.run(`rm -f ${shellQuote(path)}`)
+  }
+
+  /**
+   * Remote file content hash for post-write verification. Tries GNU
+   * `sha256sum` then BSD `shasum -a 256`; returns the lowercase hex digest or
+   * `undefined` when no such tool exists (verification is then skipped).
+   * Locale-independent: the digest is hex, never localized text.
+   */
+  async sha256(path) {
+    for (const cmd of [`sha256sum ${shellQuote(path)}`, `shasum -a 256 ${shellQuote(path)}`]) {
+      const res = await this.run(`${cmd} 2>/dev/null`)
+      if (res.ok) {
+        const hash = (res.stdout ?? '').trim().split(/\s+/)[0]
+        if (/^[0-9a-f]{64}$/i.test(hash)) return hash.toLowerCase()
+      }
+    }
+    return undefined
   }
 }

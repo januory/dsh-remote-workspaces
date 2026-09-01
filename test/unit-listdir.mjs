@@ -2,12 +2,12 @@ import { SshClient, shellQuote } from '../src/transport.js'
 import { loadMachines } from '../src/machine-store.js'
 
 const machines = loadMachines()
-const mac = machines.find((m) => m.alias === 'mac') || machines[0]
-console.log('machine:', JSON.stringify({ alias: mac.alias, host: mac.host, user: mac.user, port: mac.port, identityFile: mac.identityFile, hasPassphrase: !!mac.passphrase }))
+const machine = machines.find((m) => m.alias === 'test') || machines[0]
+console.log('machine:', JSON.stringify({ alias: machine.alias, host: machine.host, user: machine.user, port: machine.port, identityFile: machine.identityFile, hasPassphrase: !!machine.passphrase }))
 
 const client = new SshClient({
-  host: mac.host, user: mac.user, port: mac.port,
-  identityFile: mac.identityFile, passphrase: mac.passphrase,
+  host: machine.host, user: machine.user, port: machine.port,
+  identityFile: machine.identityFile, passphrase: machine.passphrase,
 })
 
 async function resolve(raw) {

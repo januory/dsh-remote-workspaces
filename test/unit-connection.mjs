@@ -1,9 +1,9 @@
 import { SshClient } from '../src/transport.js'
 import { loadMachines } from '../src/machine-store.js'
 
-const machine = loadMachines().find((m) => m.alias === 'master')
+const machine = loadMachines().find((m) => m.alias === 'test') || loadMachines()[0]
 if (!machine) {
-  console.log('SKIP: no "master" machine in the registry (~/.dsh/remote-workspaces/machines.json)')
+  console.log('SKIP: no machine in the registry (~/.dsh/remote-workspaces/machines.json)')
   process.exit(0)
 }
 const client = new SshClient({
@@ -11,7 +11,7 @@ const client = new SshClient({
   identityFile: machine.identityFile, passphrase: machine.passphrase,
 })
 
-console.log('== testConnection (master, passphrase key via ssh2) ==')
+console.log('== testConnection (passphrase key via ssh2) ==')
 const t = await client.run('echo ok', { timeoutMs: 20000 })
 console.log('result:', JSON.stringify({ ok: t.ok, ms: t.ms, error: t.error, out: (t.stdout || '').trim() }))
 

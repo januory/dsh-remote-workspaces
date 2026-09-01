@@ -9,8 +9,8 @@
  *    workspace-add holes (`conversation.hero.workspace.directoryFlow` and
  *    `sidebar.workspaces.directoryFlow`) at a lower priority so it shadows the
  *    native chooser and offers BOTH "本地文件夹" (delegates to the host
- *    chooser) and "远程目录" (pick a machine → browse the remote → SFTP-mirror
- *    → hand the local mirror path back through `onPicked`).
+ *    chooser) and "远程目录" (pick a machine → browse the remote → open it as
+ *    a remote workspace → hand the anchor path back through `onPicked`).
  *
  * Served verbatim as a classic script, so it self-registers through
  * `window.__ModuleLoader__` in factory form (no ESM import/export); `react` is
@@ -56,13 +56,7 @@ var INVOCATIONS = [
   invocation('sshAliasDetail', [jsonParameter('alias')]),
   invocation('testConnection', [jsonParameter('machine')]),
   invocation('listRemoteDir', [jsonParameter('machine'), jsonParameter('path')]),
-  invocation('mirrorRemote', [jsonParameter('machine'), jsonParameter('path')]),
-  invocation('listMirrors'),
-  invocation('syncMirror', [jsonParameter('localDir')]),
-  invocation('listSyncLog', [jsonParameter('query')]),
-  invocation('clearSyncLog'),
-  invocation('removeMirror', [jsonParameter('localDir')]),
-  invocation('cleanOrphans'),
+  invocation('openRemoteWorkspace', [jsonParameter('machine'), jsonParameter('path')]),
 ]
 
 function unwrapRemote(res) {
@@ -132,30 +126,6 @@ window.__ModuleLoader__.load({
       var resultsState = React.useState({})
       var results = resultsState[0]
       var setResults = resultsState[1]
-      var mirrorsState = React.useState([])
-      var mirrors = mirrorsState[0]
-      var setMirrors = mirrorsState[1]
-      var mirrorsLoadedState = React.useState(false)
-      var mirrorsLoaded = mirrorsLoadedState[0]
-      var setMirrorsLoaded = mirrorsLoadedState[1]
-      var syncingState = React.useState({})
-      var syncing = syncingState[0]
-      var setSyncing = syncingState[1]
-      var syncResultsState = React.useState({})
-      var syncResults = syncResultsState[0]
-      var setSyncResults = syncResultsState[1]
-      var logState = React.useState([])
-      var log = logState[0]
-      var setLog = logState[1]
-      var logLoadingState = React.useState(false)
-      var logLoading = logLoadingState[0]
-      var setLogLoading = logLoadingState[1]
-      var showLogState = React.useState(false)
-      var showLog = showLogState[0]
-      var setShowLog = showLogState[1]
-      var expandedState = React.useState({})
-      var expanded = expandedState[0]
-      var setExpanded = expandedState[1]
       var expandedHostsState = React.useState({})
       var expandedHosts = expandedHostsState[0]
       var setExpandedHosts = expandedHostsState[1]
@@ -187,7 +157,6 @@ window.__ModuleLoader__.load({
                 setLoading(false)
               },
             )
-            refreshMirrors(ns)
           },
           function (err) { if (alive) setMountError(err && err.message ? err.message : String(err)) },
         )
@@ -250,17 +219,11 @@ window.__ModuleLoader__.load({
         if (!remote || !deleteTarget || deleting) return
         setDeleting(true)
         var machine = deleteTarget
-        var itsMirrors = mirrorsForMachine(machine)
-        Promise.all(itsMirrors.map(function (m) {
-          return remote.removeMirror(m.localDir).catch(function () {})
-        })).then(function () {
-          return remote.deleteMachine(machine.id)
-        }).then(
+        remote.deleteMachine(machine.id).then(
           function () {
             setDeleting(false)
             setDeleteTarget(null)
             refreshMachines()
-            refreshMirrors()
           },
           function (err) {
             setDeleting(false)
@@ -312,124 +275,6 @@ window.__ModuleLoader__.load({
         )
       }
 
-      function refreshMirrors(ns) {
-        var n = ns || remote
-        if (!n) return
-        n.listMirrors().then(
-          function (res) {
-            var b = unwrapRemote(res)
-            if (b.ok) setMirrors(b.mirrors || [])
-            setMirrorsLoaded(true)
-          },
-          function () { setMirrorsLoaded(true) },
-        )
-      }
-
-      function doSync(localDir) {
-        setSyncing(function (prev) { var n = Object.assign({}, prev); n[localDir] = true; return n })
-        remote.syncMirror(localDir).then(
-          function (res) {
-            var b = unwrapRemote(res)
-            setSyncing(function (prev) { var n = Object.assign({}, prev); n[localDir] = false; return n })
-            setSyncResults(function (prev) { var n = Object.assign({}, prev); n[localDir] = b; return n })
-            refreshMirrors()
-            loadLog()
-          },
-          function (err) {
-            setSyncing(function (prev) { var n = Object.assign({}, prev); n[localDir] = false; return n })
-            setSyncResults(function (prev) {
-              var n = Object.assign({}, prev)
-              n[localDir] = { ok: false, error: err && err.message ? err.message : String(err) }
-              return n
-            })
-          },
-        )
-      }
-
-      function doSyncAll() {
-        if (!remote || syncing.__all) return
-        setSyncing(function (prev) { var n = Object.assign({}, prev); n.__all = true; return n })
-        Promise.all(mirrors.map(function (m) {
-          return remote.syncMirror(m.localDir).then(unwrapRemote)
-        })).then(
-          function () {
-            setSyncing(function (prev) { var n = Object.assign({}, prev); n.__all = false; return n })
-            refreshMirrors()
-            loadLog()
-          },
-          function () {
-            setSyncing(function (prev) { var n = Object.assign({}, prev); n.__all = false; return n })
-            refreshMirrors()
-          },
-        )
-      }
-
-      function doCleanOrphans() {
-        if (!remote) return
-        setSyncing(function (prev) { var n = Object.assign({}, prev); n.__clean = true; return n })
-        remote.cleanOrphans().then(
-          function (res) {
-            var b = unwrapRemote(res)
-            setSyncing(function (prev) { var n = Object.assign({}, prev); n.__clean = false; return n })
-            if (!b.ok) setError(b.error || '清理孤儿文件夹失败')
-            refreshMirrors()
-            loadLog()
-          },
-          function (err) {
-            setSyncing(function (prev) { var n = Object.assign({}, prev); n.__clean = false; return n })
-            setError(err && err.message ? err.message : String(err))
-          },
-        )
-      }
-
-      function doRemove(localDir) {
-        if (!remote) return
-        setSyncing(function (prev) { var n = Object.assign({}, prev); n[localDir] = true; return n })
-        remote.removeMirror(localDir).then(
-          function () {
-            setSyncing(function (prev) { var n = Object.assign({}, prev); n[localDir] = false; return n })
-            refreshMirrors()
-            loadLog()
-          },
-          function (err) {
-            setSyncing(function (prev) { var n = Object.assign({}, prev); n[localDir] = false; return n })
-            setError(err && err.message ? err.message : String(err))
-          },
-        )
-      }
-
-      function loadLog() {
-        if (!remote) return
-        setLogLoading(true)
-        remote.listSyncLog({ limit: 50 }).then(
-          function (res) {
-            var b = unwrapRemote(res)
-            setLogLoading(false)
-            if (b.ok) setLog(b.entries || [])
-          },
-          function () { setLogLoading(false) },
-        )
-      }
-
-      function doClearLog() {
-        if (!remote) return
-        remote.clearSyncLog().then(function () { setLog([]) })
-      }
-
-      function toggleShowLog() {
-        var next = !showLog
-        setShowLog(next)
-        if (next) loadLog()
-      }
-
-      function toggleExpanded(key) {
-        setExpanded(function (prev) {
-          var n = Object.assign({}, prev)
-          n[key] = !prev[key]
-          return n
-        })
-      }
-
       function toggleHost(id) {
         setExpandedHosts(function (prev) {
           var n = Object.assign({}, prev)
@@ -438,21 +283,12 @@ window.__ModuleLoader__.load({
         })
       }
 
-      function mirrorsForMachine(machine) {
-        return mirrors.filter(function (m) {
-          return !m.orphan
-            && m.host === machine.host
-            && String(m.user || '') === String(machine.user || '')
-            && (Number(m.port) || 22) === (Number(machine.port) || 22)
-        })
-      }
-
       return React.createElement(
         'div',
         { style: sectionStyle },
         React.createElement('div', { style: { fontWeight: 600, fontSize: 16, marginBottom: 8 } }, '远程工作区'),
         React.createElement('p', { style: { margin: '0 0 12px' } },
-          '管理 SSH 主机与已打开的远程工作区。添加远程工作区请在侧边栏「添加工作区」里选「远程目录」；本地改动会自动同步回远端。'),
+          '管理 SSH 主机与已打开的远程工作区。添加远程工作区请在侧边栏「添加工作区」里选「远程目录」。'),
         mountError !== null
           ? React.createElement('p', { style: { color: dangerColor, margin: '0 0 12px' } }, 'Remote 命名空间挂载失败：' + mountError)
           : null,
@@ -487,65 +323,26 @@ window.__ModuleLoader__.load({
             : React.createElement('div', { style: { marginTop: 4 } },
                 React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 } },
                   React.createElement('div', { style: { fontWeight: 600 } }, '主机（' + machines.length + '）'),
-                  React.createElement('span', { style: { flex: 1 } }),
-                  React.createElement('button', { type: 'button', onClick: doSyncAll, disabled: !remote || mirrors.length === 0 || syncing.__all, style: btnStyle }, syncing.__all ? '同步中…' : '全部同步'),
                 ),
                 machines.map(function (machine) {
                   var open = expandedHosts[machine.id] !== false
                   return MachineRow(
                     machine,
                     results[machine.id],
-                    mirrorsForMachine(machine),
                     open,
                     function () { toggleHost(machine.id) },
                     function () { doTest(machine) },
                     function () { openEdit(machine) },
                     function () { doDelete(machine) },
-                    function (localDir) { doSync(localDir) },
-                    syncing,
-                    syncResults,
                   )
                 }),
               ),
-        (function () {
-          var orphans = mirrors.filter(function (m) { return m.orphan })
-          if (orphans.length === 0) return null
-          return React.createElement('div', { style: { marginTop: 12, borderTop: '1px solid ' + borderColor, paddingTop: 8 } },
-            React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 } },
-              React.createElement('div', { style: { fontWeight: 600, color: dangerColor } }, '已删除工作区（' + orphans.length + '）'),
-              React.createElement('span', { style: { flex: 1 } }),
-              React.createElement('button', { type: 'button', onClick: doCleanOrphans, disabled: !remote || syncing.__clean, style: btnStyle }, syncing.__clean ? '清理中…' : '全部清理'),
-            ),
-            orphans.map(function (m) {
-              return MirrorRow(m, !!syncing[m.localDir], null, function () { doRemove(m.localDir) })
-            }),
-          )
-        })(),
-        React.createElement('div', { style: { marginTop: 20, borderTop: '1px solid ' + borderColor, paddingTop: 12 } },
-          React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 } },
-            React.createElement('button', { type: 'button', onClick: toggleShowLog, style: btnStyle }, showLog ? '收起同步日志' : '同步日志'),
-            showLog ? React.createElement('button', { type: 'button', onClick: loadLog, disabled: logLoading, style: btnStyle }, '刷新日志') : null,
-            showLog ? React.createElement('button', { type: 'button', onClick: doClearLog, style: btnStyle }, '清空日志') : null,
-          ),
-          showLog
-            ? logLoading
-              ? React.createElement('div', { style: labelStyle }, '加载中…')
-              : log.length === 0
-                ? React.createElement('div', { style: labelStyle }, '暂无同步记录。')
-                : log.map(function (e, i) {
-                    return SyncLogRow(e, !!expanded[i], function () { toggleExpanded(i) }, i)
-                  })
-            : null,
-        ),
         deleteTarget !== null
           ? React.createElement('div', { style: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 } },
               React.createElement('div', { style: { background: 'var(--dsw-alias-bg, #1c1c1c)', border: '1px solid ' + borderColor, borderRadius: 8, padding: 16, width: 440, maxWidth: '90vw', color: 'var(--dsw-alias-text, #ddd)' } },
                 React.createElement('div', { style: { fontWeight: 600, fontSize: 15, marginBottom: 10 } }, '删除主机'),
                 React.createElement('p', { style: { margin: '0 0 12px', lineHeight: 1.6 } },
-                  '确定删除主机「' + (deleteTarget.alias || deleteTarget.host) + '」吗？'
-                  + (mirrorsForMachine(deleteTarget).length > 0
-                    ? ' 这会同时删除它的 ' + mirrorsForMachine(deleteTarget).length + ' 个远程工作区本地镜像（远端数据不受影响）。'
-                    : '')),
+                  '确定删除主机「' + (deleteTarget.alias || deleteTarget.host) + '」吗？（远端数据不受影响）'),
                 React.createElement('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
                   React.createElement('button', { type: 'button', onClick: closeDelete, disabled: deleting, style: btnStyle }, '取消'),
                   React.createElement('button', { type: 'button', onClick: confirmDelete, disabled: deleting, style: Object.assign({}, btnStyle, { background: dangerColor, color: '#fff', borderColor: dangerColor }) }, deleting ? '删除中…' : '删除'),
@@ -556,7 +353,7 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function MachineRow(machine, result, mirrors, open, onToggle, onTest, onEdit, onDelete, onSync, syncing, syncResults) {
+    function MachineRow(machine, result, open, onToggle, onTest, onEdit, onDelete) {
       var summary = [machine.alias || '(未命名)']
       if (machine.host) summary.push(machine.host)
       if (machine.user) summary.push('@' + machine.user)
@@ -590,15 +387,6 @@ window.__ModuleLoader__.load({
             : result
               ? React.createElement('div', { style: { color: dangerColor, margin: 0, paddingLeft: 24, marginTop: 2 } }, result.error || '连接失败')
               : null,
-        open
-          ? mirrors.length === 0
-            ? React.createElement('div', { style: Object.assign({}, labelStyle, { paddingLeft: 24, marginTop: 4 }) }, '还没有打开过此主机的远程工作区')
-            : React.createElement('div', { style: { paddingLeft: 24, marginTop: 2 } },
-                mirrors.map(function (m) {
-                  return MirrorRow(m, !!syncing[m.localDir], syncResults[m.localDir], function () { onSync(m.localDir) })
-                }),
-              )
-          : null,
       )
     }
 
@@ -730,9 +518,9 @@ window.__ModuleLoader__.load({
       var browseState = React.useState(null)
       var browse = browseState[0]
       var setBrowse = browseState[1]
-      var mirroringState = React.useState(false)
-      var mirroring = mirroringState[0]
-      var setMirroring = mirroringState[1]
+      var openingState = React.useState(false)
+      var opening = openingState[0]
+      var setOpening = openingState[1]
       var localPickingState = React.useState(false)
       var localPicking = localPickingState[0]
       var setLocalPicking = localPickingState[1]
@@ -748,7 +536,7 @@ window.__ModuleLoader__.load({
         setMachinesLoaded(false)
         setSelected(null)
         setBrowse(null)
-        setMirroring(false)
+        setOpening(false)
         setLocalPicking(false)
         var ns = getRemote()
         if (!ns) return
@@ -829,13 +617,13 @@ window.__ModuleLoader__.load({
       }
 
       function doOpenRemote() {
-        if (mirroring || !selected || !browse) return
-        setMirroring(true)
-        getRemote().mirrorRemote(selected, browse.path).then(
+        if (opening || !selected || !browse) return
+        setOpening(true)
+        getRemote().openRemoteWorkspace(selected, browse.path).then(
           function (res) {
             var b = unwrapRemote(res)
             if (b.ok && b.localDir) onPicked(b.localDir)
-            else onError(b.error || '镜像失败')
+            else onError(b.error || '打开远程工作区失败')
           },
           function (err) { onError(err && err.message ? err.message : String(err)) },
         )
@@ -913,62 +701,13 @@ window.__ModuleLoader__.load({
                               )
                             : null,
                       React.createElement('div', { style: { marginTop: 10 } },
-                        React.createElement('button', { type: 'button', onClick: doOpenRemote, disabled: mirroring || busy || (browse && browse.loading), style: btnStyle },
-                          mirroring ? '镜像中…' : '打开此目录'),
+                        React.createElement('button', { type: 'button', onClick: doOpenRemote, disabled: opening || busy || (browse && browse.loading), style: btnStyle },
+                          opening ? '打开中…' : '打开此目录'),
                       ),
                     )
                   : null,
               ),
         ),
-      )
-    }
-
-    function MirrorRow(m, isSyncing, result, onSync) {
-      return React.createElement(
-        'div',
-        { key: m.localDir, style: { display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0' } },
-        React.createElement('div', { style: { flex: 1, minWidth: 0 } },
-          React.createElement('div', { style: monoStyle }, '📁 ' + (m.remotePath || pathBasename(m.localDir))),
-          React.createElement('div', { style: labelStyle },
-            (m.files || 0) + ' 个文件' + (m.lastSyncedAt ? ' · 上次同步 ' + m.lastSyncedAt.slice(0, 19).replace('T', ' ') : '')),
-          result && result.ok === true
-            ? React.createElement('div', { style: { color: successColor, margin: 0 } }, '已同步：拉取 ' + result.pulled + '，推送 ' + result.pushed + (result.failed ? '，失败 ' + result.failed : ''))
-            : result && result.ok === false
-              ? React.createElement('div', { style: { color: dangerColor, margin: 0 } }, result.error || '同步失败')
-              : null,
-        ),
-        React.createElement('button', { type: 'button', onClick: onSync, disabled: isSyncing, style: btnStyle }, isSyncing ? (m.orphan ? '清理中…' : '同步中…') : (m.orphan ? '清理' : '同步')),
-      )
-    }
-
-    function SyncLogRow(e, isExpanded, onToggle, key) {
-      var triggerLabel = { auto: '自动', manual: '手动', mirror: '首次镜像' }[e.trigger] || e.trigger
-      var line = (e.ts || '').slice(0, 19).replace('T', ' ')
-      var summary = triggerLabel + ' · ' + (e.user ? e.user + '@' : '') + (e.host || '') + ' · ' + (e.remotePath || '')
-      var stats = '拉取 ' + (e.pulled || 0) + ' / 推送 ' + (e.pushed || 0) + ' / 跳过 ' + (e.skippedLarge || 0)
-        + (e.failed ? ' / 失败 ' + e.failed : '')
-      var changes = e.changes || []
-      return React.createElement(
-        'div',
-        { key: key, style: { borderTop: '1px solid ' + borderColor, padding: '6px 0' } },
-        React.createElement('div', { onClick: onToggle, style: { display: 'flex', alignItems: 'center', gap: 8, cursor: changes.length ? 'pointer' : 'default' } },
-          React.createElement('span', { style: { color: e.ok === false ? dangerColor : 'inherit', fontFamily: 'ui-monospace, monospace', fontSize: 12 } }, line),
-          React.createElement('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, summary),
-          React.createElement('span', { style: labelStyle }, stats + (changes.length ? ' · ' + changes.length + ' 个文件' : '')),
-          changes.length ? React.createElement('span', { style: labelStyle }, isExpanded ? '▾' : '▸') : null,
-        ),
-        e.ok === false && e.error
-          ? React.createElement('div', { style: { color: dangerColor, margin: '2px 0 0' } }, e.error)
-          : null,
-        isExpanded
-          ? React.createElement('div', { style: { marginTop: 4, paddingLeft: 12, fontFamily: 'ui-monospace, monospace', fontSize: 12, maxHeight: 180, overflow: 'auto' } },
-              changes.map(function (c, i) {
-                var label = { pull: '↓ 拉取', push: '↑ 推送', 'delete-local': '⊘ 本地删除', 'delete-remote': '⊘ 远端删除', 'skip-large': '⏭ 跳过(大)', error: '⚠ 失败' }[c.action] || c.action
-                var text = label + '  ' + c.path + (c.error ? ' — ' + c.error : '')
-                return React.createElement('div', { key: i, style: { color: c.action === 'error' ? dangerColor : 'var(--dsw-alias-label-secondary, #888)' } }, text)
-              }),
-            )
-          : null,
       )
     }
 
@@ -978,7 +717,7 @@ window.__ModuleLoader__.load({
       var mount = ctx.remote.$mount({ package: PACKAGE, descriptors: INVOCATIONS })
       var getRemote = function () { return ctx.get('remote.' + NAMESPACE) }
 
-      // Settings section: machines + open remote workspaces (grouped by host) + sync log.
+      // Settings section: machines + open remote workspaces (grouped by host).
       ctx.slots.inject('settings.section', function () {
         return ctx.slots.register(
           { name: 'settings.section', id: 'remote-workspaces', order: 100, label: '远程工作区' },

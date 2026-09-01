@@ -8,7 +8,6 @@
   "main": "./src/index.js",
   "exports": {
     ".": "./src/index.js",
-    "./fs": "./src/fs-plugin.js",
     "./client": "./src/client.js"
   },
   "files": [
@@ -16,7 +15,8 @@
     "cordis.patch.yml"
   ],
   "scripts": {
-    "test": "node test/unit-mirror-path.mjs"
+    "test": "node test/unit-anchor-path.mjs && node test/unit-secrets-encryption.mjs && node test/unit-fs.mjs && node test/unit-shell.mjs && node test/unit-routing.mjs && node test/unit-search-registration.mjs",
+    "test:integration": "node test/integration-remote.mjs"
   },
   "dependencies": {
     "ssh2": "^1.17.0"

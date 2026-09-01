@@ -1,9 +1,9 @@
 import { SshClient } from '../src/transport.js'
 import { loadMachines } from '../src/machine-store.js'
 
-const machine = loadMachines().find((m) => m.alias === 'master')
+const machine = loadMachines().find((m) => m.alias === 'test') || loadMachines()[0]
 if (!machine || !machine.identityFile || !machine.passphrase) {
-  console.log('SKIP: needs a passphrase-protected "master" machine in the registry')
+  console.log('SKIP: needs a passphrase-protected machine in the registry')
   process.exit(0)
 }
 
