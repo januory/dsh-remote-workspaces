@@ -4,7 +4,7 @@ import { loadMachines, sanitizeMachine, upsertMachine, removeMachine, machineByI
 import { ensureAnchor } from './anchor.js'
 import { RoutingFileSystem } from './routing-fs.js'
 import { SshShellExecutor } from './shell-exec.js'
-import { registerAnchor, unregisterAnchor } from './registry.js'
+import { registerAnchor, unregisterAnchor, findByCwd } from './registry.js'
 import { applySearchTools } from './search.js'
 
 export { parseSshConfig, expandTilde } from './ssh-config.js'
@@ -273,18 +273,39 @@ export function apply(ctx) {
     applySearchTools(toolsCtx, remote)
   })
 
-  // Clarify remote workspaces to the model: the harness shows the LOCAL anchor
-  // as the "working directory" (it must be a real local path for the workspace
-  // identity), but the real files and commands live on the remote host.
+  // Shadow the harness's global `cwd` prompt variable per-agent so a remote
+  // workspace's persona line ("Your working directory is {{cwd}}") shows the
+  // REMOTE path instead of the empty local anchor. Local agents keep their cwd
+  // unchanged. Routing still uses `session.header.cwd` — this only rewrites the
+  // prompt text.
+  ctx.on('agent/created', ({ agent }) => {
+    agent.ctx.inject(['systemPrompt'], (scope) => {
+      scope.systemPrompt.variable('cwd', (context) => {
+        const cwd = context.agent?.session?.header?.cwd
+        if (typeof cwd !== 'string' || cwd === '') return cwd
+        const hit = findByCwd(cwd)
+        if (hit === undefined) return cwd
+        return hit.remoteSubpath === '' ? hit.remotePath : `${hit.remotePath.replace(/\/+$/, '')}/${hit.remoteSubpath}`
+      })
+    })
+  })
+
+  // Clarify remote workspaces to the model — only when the session's cwd is a
+  // registered remote anchor (empty text hides the section for local sessions).
   ctx.inject(['systemPrompt'], (sctx) => {
     const systemPrompt = sctx.get('systemPrompt')
     if (systemPrompt === undefined) return
     systemPrompt.section({
       name: 'remote-workspaces:notice',
       order: 10,
-      text: 'Remote workspace: this workspace may be a REMOTE workspace opened over SSH. '
-        + 'The "working directory" shown is a local anchor (empty); the real files and commands live on a remote host. '
-        + 'Use relative paths in file/search tools (they route to the remote automatically); run `bash pwd` to see the actual remote path.',
+      text: (context) => {
+        const cwd = context.agent?.session?.header?.cwd
+        if (typeof cwd !== 'string' || cwd === '') return ''
+        const hit = findByCwd(cwd)
+        if (hit === undefined) return ''
+        const host = hit.user ? `${hit.user}@${hit.host}` : hit.host
+        return `Remote workspace over SSH (${host}): file/search tools and shell commands run on the remote host; use relative paths (they route to the remote automatically).`
+      },
     })
   })
 
