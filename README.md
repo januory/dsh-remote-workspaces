@@ -15,6 +15,7 @@ Once a remote directory is opened as a workspace, the agent's file tools (`read`
 - **`~/.ssh/config` import** — list configured aliases and pre-fill the connection form.
 - **Connection test** — verify a host before using it.
 - **Transparent tool routing** — `read`/`write`/`edit` go through SFTP, `grep`/`glob` run ripgrep on the remote, and `bash`/`pwsh` commands execute over ssh2 exec. Local paths keep the harness's own sandbox.
+- **Policy-aware remote mutations** — the harness file policy applies to remote workspaces too: `read-only` denies `write`/`edit` and remote shell commands, `workspace-write` confines `write`/`edit` to the remote workspace root (plus `/tmp`) while remote shell commands need a `danger-full-access` approval, and `danger-full-access` delegates to the SSH account.
 
 ## How it works
 

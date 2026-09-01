@@ -154,7 +154,30 @@ export class SshShellExecutor {
     }
   }
 
+  /**
+   * A remote command refused because the policy cannot be enforced on the
+   * remote host: `read-only` and `workspace-write` would both be bypassed by
+   * arbitrary remote code (there is no directory-level sandbox on the remote),
+   * so under either mode the command does not run. The result reports the
+   * shared sandbox denial (the tool layer turns it into the `[sandbox: …]`
+   * marker + escalation hint), and the command can still run after the user
+   * approves a `sandbox_permissions: danger-full-access` escalation.
+   */
+  deniedRemoteResult(spec, mode) {
+    return {
+      exitCode: 1, signal: null, timedOut: false, aborted: false,
+      timeoutMs: spec.timeoutMs,
+      stdout: { text: '', truncated: false },
+      stderr: { text: '', truncated: false },
+      sandbox: { mode, denied: true },
+    }
+  }
+
   async remoteRun(spec) {
+    const policy = this.policy(spec)
+    if (policy !== undefined && policy.mode !== 'danger-full-access') {
+      return this.deniedRemoteResult(spec, policy.mode)
+    }
     const { client, path } = this.clientFor(spec)
     const result = await client.execShell(spec.command, {
       cwd: path,
@@ -180,6 +203,18 @@ export class SshShellExecutor {
   }
 
   remoteStart(spec) {
+    const policy = this.policy(spec)
+    if (policy !== undefined && policy.mode !== 'danger-full-access') {
+      return {
+        status: 'completed',
+        exitCode: 1,
+        signal: null,
+        sandbox: { mode: policy.mode, denied: true },
+        readOutput() { return { delta: '', lossy: false } },
+        kill() { return false },
+        done: Promise.resolve(),
+      }
+    }
     const parsed = parseRemoteWorkdir(spec.workdir)
     const client = this.clientForRemote(parsed.host, parsed.user, parsed.port)
     const path = parsed.path

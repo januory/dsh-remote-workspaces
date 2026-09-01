@@ -15,6 +15,7 @@
 - **`~/.ssh/config` 导入** —— 列出已配置的别名并自动填充连接表单。
 - **连接测试** —— 使用前先验证主机连通性。
 - **透明的工具路由** —— `read`/`write`/`edit` 走 SFTP，`grep`/`glob` 在远端跑ripgrep，`bash`/`pwsh` 命令通过 ssh2 exec 执行。本地路径沿用 harness 自身的沙箱。
+- **感知权限策略的远端写操作** —— harness 的文件策略同样作用于远程工作区：`read-only` 会拒绝 `write`/`edit` 和远程 shell 命令，`workspace-write` 把 `write`/`edit` 限制在远程工作区根目录（以及 `/tmp`）内、而远程 shell 命令需经 `danger-full-access` 审批后放行，`danger-full-access` 则交由 SSH 账号自身权限决定。
 
 ## 工作原理
 

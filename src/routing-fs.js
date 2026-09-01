@@ -22,19 +22,25 @@ import { LocalBackend } from './local-backend.js'
 import { SftpBackend } from './fs-sftp.js'
 import { isRemoteCwd, parseSshUri } from './ssh-uri.js'
 import { findByCwd } from './registry.js'
+import { fsError } from './errors.js'
 
 export class RoutingFileSystem {
   constructor({ getPolicy, clientForRemote } = {}) {
+    this.getPolicy = getPolicy
     this.local = new LocalBackend({ getPolicy })
     this.clientForRemote = clientForRemote
     this.remoteBackends = new Map()
   }
 
   /**
-   * The local half confines under `workspace-write`; reporting it keeps the
-   * tool layer wiring the per-session sandbox policy (the correct workspace
-   * root) into every mutation. The remote half ignores that policy — the SSH
-   * account's permissions are the boundary.
+   * Report a DEFINED `sandboxMode` so the tool layer treats this provider as
+   * confining: it resolves the per-session policy, stamps every mutation with
+   * it, and advertises escalation. Only definedness is read — the value itself
+   * is a stand-in; the real per-call mode rides `sandboxPolicy`. The local
+   * half fences writes in `LocalBackend.checkedTarget`; the remote half is
+   * fenced here (`read-only` denies, `workspace-write` contains to the remote
+   * workspace root, `danger-full-access` delegates). The SSH account's own
+   * permissions remain the outer boundary.
    */
   get sandboxMode() {
     return 'workspace-write'
@@ -170,14 +176,54 @@ export class RoutingFileSystem {
     }))
   }
 
+  /** POSIX containment: `path` is `root` or a descendant of it. */
+  posixUnder(path, root) {
+    const rel = posix.relative(root, path)
+    return rel === '' || (rel !== '..' && !rel.startsWith('../') && !posix.isAbsolute(rel))
+  }
+
+  /**
+   * Enforce the per-call sandbox policy on a REMOTE mutation (the local half
+   * fences itself in `LocalBackend.checkedTarget`). `read-only` denies;
+   * `workspace-write` contains the target under the session's remote workspace
+   * root (the anchor's remote origin, plus the POSIX temp dirs); a
+   * `danger-full-access` policy — or none — delegates unfenced. The target key
+   * is already SFTP-canonicalized by `resolve`, so no re-resolve is needed.
+   */
+  remoteCheckedTarget(sub, sandboxPolicy) {
+    const policy = sandboxPolicy ?? this.getPolicy?.()?.resolve?.()
+    if (policy === undefined) return sub
+    const { mode } = policy
+    if (mode === 'danger-full-access') return sub
+    if (mode === 'read-only') {
+      throw fsError('FS_SANDBOX_DENIED', `cannot write "${sub.displayPath}": file access denied under read-only mode`)
+    }
+    // workspace-write: the policy's workspace root is the LOCAL anchor path;
+    // its remote origin is the containment boundary.
+    const hit = findByCwd(policy.workspaceRoot)
+    const remoteRoot = hit === undefined
+      ? undefined
+      : (hit.remoteSubpath === '' ? hit.remotePath : posix.join(hit.remotePath, hit.remoteSubpath))
+    if (remoteRoot === undefined) {
+      throw fsError('FS_SANDBOX_DENIED', `cannot write "${sub.displayPath}": file access denied under workspace-write mode`)
+    }
+    const writable = [remoteRoot, '/tmp', '/var/tmp']
+    if (!writable.some((root) => this.posixUnder(sub.targetKey, root))) {
+      throw fsError('FS_SANDBOX_DENIED', `cannot write "${sub.displayPath}": file access denied under workspace-write mode`)
+    }
+    return sub
+  }
+
   writeText(target, content, expected, signal, sandboxPolicy) {
     const { backend, target: sub } = this.splitTarget(target)
-    return backend.writeText(sub, content, expected, signal, sandboxPolicy)
+    if (backend === this.local) return backend.writeText(sub, content, expected, signal, sandboxPolicy)
+    return backend.writeText(this.remoteCheckedTarget(sub, sandboxPolicy), content, expected)
   }
 
   editText(target, edit, expected, signal, sandboxPolicy) {
     const { backend, target: sub } = this.splitTarget(target)
-    return backend.editText(sub, edit, expected, signal, sandboxPolicy)
+    if (backend === this.local) return backend.editText(sub, edit, expected, signal, sandboxPolicy)
+    return backend.editText(this.remoteCheckedTarget(sub, sandboxPolicy), edit, expected)
   }
 }
 
