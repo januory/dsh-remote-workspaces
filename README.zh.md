@@ -130,7 +130,7 @@ pnpm test:integration
 
 ## 发布（维护者）
 
-发布完全手动触发：GitHub Actions → **release** → **Run workflow**，输入版本增量（`patch` / `minor` / `major`，或直接写完整版本号如 `0.2.0`）。工作流会自动执行：`npm version` 改版本号并打 `vX.Y.Z` tag → 推送 `main` 与 tag → 跑单元测试（`npm test`）→ `npm publish`（带 provenance）→ 用 `--generate-notes` 创建 GitHub Release。
+发布完全手动触发、**零输入**：版本号直接取自 `package.json`，发布前先在 `main` 上提交改好的 `version`，然后 GitHub Actions → **release** → **Run workflow** 即可。工作流会自动执行：跑单元测试（`npm test`）→ 校验 `v<version>` tag 尚未存在（防止重复发布）→ `npm publish`（带 provenance）→ 打 `v<version>` tag 并推送 → 用 `--generate-notes` 创建 GitHub Release。
 
 前提：在仓库 **Settings → Secrets and variables → Actions** 中配置名为 `NPM_TOKEN` 的 secret（npm automation token，或对该包有 publish 权限的 granular token）；发布账号须是持有该包名的 npm 用户。
 
@@ -139,11 +139,11 @@ pnpm test:integration
 ```sh
 npm login
 
-npm version patch -m 'chore: release v%s'
-
-git push origin main --tags
-
 npm publish --provenance
+
+git tag "v$(node -p \"require('./package.json').version\")"
+
+git push origin --tags
 ```
 
 ## 开源协议

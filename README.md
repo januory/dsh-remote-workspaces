@@ -128,7 +128,7 @@ pnpm test:integration
 
 ## Publishing (maintainers)
 
-Releases are fully manual: GitHub Actions → **release** → **Run workflow**, entering a version bump (`patch` / `minor` / `major`, or an explicit version like `0.2.0`). The workflow then: bumps the version and creates the `vX.Y.Z` tag via `npm version`, pushes `main` and the tag, runs the unit tests (`npm test`), publishes to npm with provenance (`npm publish --provenance`), and creates a GitHub Release with `--generate-notes`.
+Releases are fully manual with **zero input**: the version comes straight from `package.json` — commit the new `version` on `main` first, then GitHub Actions → **release** → **Run workflow**. The workflow runs the unit tests (`npm test`), guards that the `v<version>` tag does not exist yet (prevents duplicate releases), publishes to npm with provenance (`npm publish --provenance`), creates and pushes the `v<version>` tag, and creates a GitHub Release with `--generate-notes`.
 
 Prerequisites: configure an `NPM_TOKEN` secret in **Settings → Secrets and variables → Actions** (an npm automation token, or a granular token with publish permission on the package); the publishing account must be the npm user owning the package name.
 
@@ -137,11 +137,11 @@ Equivalent manual flow:
 ```sh
 npm login
 
-npm version patch -m 'chore: release v%s'
-
-git push origin main --tags
-
 npm publish --provenance
+
+git tag "v$(node -p \"require('./package.json').version\")"
+
+git push origin --tags
 ```
 
 ## License

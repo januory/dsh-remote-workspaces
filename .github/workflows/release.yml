@@ -1,8 +1,9 @@
-# 手动发布（workflow_dispatch）：
-#   1. npm version 修改 package.json 版本并打 vX.Y.Z tag
-#   2. 推送 main 分支与 tag
-#   3. 跑单元测试
-#   4. npm publish（provenance）
+# 一键手动发布（workflow_dispatch，零输入）：
+#   版本号直接取自 package.json —— 发版前先在 main 上提交改好的 version。
+#   1. 跑单元测试
+#   2. 校验 v<version> tag 尚未存在（防止重复发布）
+#   3. npm publish（provenance）
+#   4. 打 v<version> tag 并推送
 #   5. 用 --generate-notes 创建 GitHub Release
 #
 # 前提：仓库 Secrets 中配置 NPM_TOKEN（npm automation token 或带 publish 权限的 granular token）。
@@ -11,14 +12,9 @@ name: release
 
 on:
   workflow_dispatch:
-    inputs:
-      bump:
-        description: '版本增量：patch | minor | major；或直接写完整版本号，如 0.2.0'
-        required: true
-        default: patch
 
 permissions:
-  contents: write # push main + tag、创建 GitHub Release
+  contents: write # push tag、创建 GitHub Release
   id-token: write # npm publish provenance（npmjs 公开包）
 
 concurrency:
@@ -46,23 +42,26 @@ jobs:
       - name: Run unit tests
         run: npm test
 
-      - name: Bump version and create tag
+      - name: Read version and guard duplicate release
         id: version
         run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          npm version "${{ inputs.bump }}" -m 'chore: release v%s'
-          echo "tag=v$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
+          version="$(node -p "require('./package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
+            echo "::error::v$version 已发布过（tag 已存在）；请先在 package.json 中把 version 改成新版本并提交，再重新触发"
+            exit 1
+          fi
 
       - name: Publish to npm
         run: npm publish --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Push main and tag
+      - name: Create and push tag
         run: |
-          git push origin main
-          git push origin "refs/tags/${{ steps.version.outputs.tag }}"
+          git tag "v${{ steps.version.outputs.version }}"
+          git push origin "refs/tags/v${{ steps.version.outputs.version }}"
 
       - name: Create GitHub Release
         env:
