@@ -1,6 +1,6 @@
 {
   "name": "dsh-remote-workspaces",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Open folders on remote hosts over SSH as DeepSeek Harness workspaces — a non-invasive DSH bundle.",
   "license": "MIT",

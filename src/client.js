@@ -75,15 +75,81 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     var React = require('react')
 
-    var sectionStyle = { padding: 16, fontSize: 14, lineHeight: 1.6, maxWidth: 820 }
-    var labelStyle = { color: 'var(--dsw-alias-label-secondary, #888)', margin: 0, fontSize: 12.5 }
+    var sectionStyle = { padding: 16, fontSize: 14, lineHeight: 1.6, maxWidth: 820, color: 'inherit' }
+    var labelStyle = { color: '#8b8f98', margin: 0, fontSize: 12.5 }
     var monoStyle = { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace', fontSize: 12.5 }
-    var btnStyle = { padding: '5px 12px', cursor: 'pointer' }
-    var inputStyle = { padding: '5px 8px', fontSize: 13, width: '100%', boxSizing: 'border-box' }
-    var dangerColor = 'var(--dsw-alias-danger, #c00)'
-    var successColor = 'var(--dsw-alias-success, #0a0)'
-    var borderColor = 'var(--dsw-alias-border, #333)'
-    var chipStyle = { display: 'inline-block', padding: '1px 8px', borderRadius: 10, background: 'rgba(127,127,127,0.18)', fontSize: 11.5, lineHeight: '18px' }
+    // Control styling mirrors the "网关接入 → 查询状态" button (plugins/
+    // dsh-gateway-agent): neutral translucent surfaces + `color: inherit` so the
+    // text follows the host theme in both dark and light themes. The primary
+    // button is a fixed brand fill, matching the reference's S.primary.
+    var btnStyle = {
+      padding: '7px 14px', fontSize: 13.5, cursor: 'pointer',
+      background: 'rgba(127,127,127,0.12)', color: 'inherit',
+      border: '1px solid rgba(127,127,127,0.3)', borderRadius: 6, whiteSpace: 'nowrap',
+    }
+    var mobileBtnStyle = {
+      padding: '11px 14px', fontSize: 14, cursor: 'pointer',
+      background: 'rgba(127,127,127,0.12)', color: 'inherit',
+      border: '1px solid rgba(127,127,127,0.3)', borderRadius: 6, minHeight: 44, whiteSpace: 'nowrap',
+    }
+    var btnPrim = {
+      padding: '7px 14px', fontSize: 13.5, cursor: 'pointer',
+      background: '#6e56cf', color: '#fff', border: '1px solid transparent',
+      borderRadius: 6, fontWeight: 600, whiteSpace: 'nowrap',
+    }
+    var btnPrimMob = {
+      padding: '11px 14px', fontSize: 14, cursor: 'pointer',
+      background: '#6e56cf', color: '#fff', border: '1px solid transparent',
+      borderRadius: 6, fontWeight: 600, minHeight: 44, whiteSpace: 'nowrap',
+    }
+    var btnDanger = {
+      padding: '7px 14px', fontSize: 13.5, cursor: 'pointer',
+      background: '#e5484d', color: '#fff', border: '1px solid transparent',
+      borderRadius: 6, fontWeight: 600, whiteSpace: 'nowrap',
+    }
+    var btnDangerMob = {
+      padding: '11px 14px', fontSize: 14, cursor: 'pointer',
+      background: '#e5484d', color: '#fff', border: '1px solid transparent',
+      borderRadius: 6, fontWeight: 600, minHeight: 44, whiteSpace: 'nowrap',
+    }
+    var inputStyle = {
+      padding: '7px 10px', fontSize: 13.5, width: '100%', boxSizing: 'border-box',
+      background: 'rgba(127,127,127,0.08)', color: 'inherit',
+      border: '1px solid rgba(127,127,127,0.3)', borderRadius: 6,
+    }
+    var mobileInputStyle = {
+      padding: '9px 12px', fontSize: 16, width: '100%', boxSizing: 'border-box', minHeight: 44,
+      background: 'rgba(127,127,127,0.08)', color: 'inherit',
+      border: '1px solid rgba(127,127,127,0.3)', borderRadius: 6,
+    }
+    var mobileSectionStyle = { padding: 12, fontSize: 14, lineHeight: 1.6, color: 'inherit' }
+    var dangerColor = '#e5484d'
+    var successColor = '#46a758'
+    var borderColor = 'rgba(127,127,127,0.3)'
+    var modalBg = '#1f1f21'
+    var modalText = '#e8e8e8'
+    var chipStyle = { display: 'inline-block', padding: '1px 8px', borderRadius: 10, background: 'rgba(127,127,127,0.18)', fontSize: 11.5, lineHeight: '18px', color: 'inherit' }
+
+    // Detect a narrow (mobile) viewport so the UI can switch to a stacked,
+    // larger-touch-target layout. Pure clickable hooks; no CSS build step.
+    function useIsMobile() {
+      var state = React.useState(false)
+      var matches = state[0]
+      var setMatches = state[1]
+      React.useEffect(function () {
+        if (typeof window === 'undefined' || !window.matchMedia) return
+        var mq = window.matchMedia('(max-width: 640px)')
+        function onChange(e) { setMatches(e.matches) }
+        setMatches(mq.matches)
+        if (mq.addEventListener) mq.addEventListener('change', onChange)
+        else if (mq.addListener) mq.addListener(onChange)
+        return function () {
+          if (mq.removeEventListener) mq.removeEventListener('change', onChange)
+          else if (mq.removeListener) mq.removeListener(onChange)
+        }
+      }, [])
+      return matches
+    }
 
     function pathBasename(p) {
       if (!p) return ''
@@ -135,6 +201,7 @@ window.__ModuleLoader__.load({
       var deletingState = React.useState(false)
       var deleting = deletingState[0]
       var setDeleting = deletingState[1]
+      var isMobile = useIsMobile()
 
       React.useEffect(function () {
         var alive = true
@@ -285,7 +352,7 @@ window.__ModuleLoader__.load({
 
       return React.createElement(
         'div',
-        { style: sectionStyle },
+        { className: 'dsh-rw-btn', style: isMobile ? mobileSectionStyle : sectionStyle },
         React.createElement('div', { style: { fontWeight: 600, fontSize: 16, marginBottom: 8 } }, '远程工作区'),
         React.createElement('p', { style: { margin: '0 0 12px' } },
           '管理 SSH 主机与已打开的远程工作区。添加远程工作区请在侧边栏「添加工作区」里选「远程目录」。'),
@@ -295,9 +362,9 @@ window.__ModuleLoader__.load({
         error !== null
           ? React.createElement('p', { style: { color: dangerColor, margin: '0 0 12px' } }, error)
           : null,
-        React.createElement('div', { style: { display: 'flex', gap: 8, marginBottom: 12 } },
-          React.createElement('button', { type: 'button', onClick: openNew, disabled: !remote, style: btnStyle }, '添加主机'),
-          React.createElement('button', { type: 'button', onClick: toggleAliases, disabled: !remote, style: btnStyle }, '从 ~/.ssh/config 导入'),
+        React.createElement('div', { style: Object.assign({ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }, isMobile ? { flexDirection: 'column' } : {}) },
+          React.createElement('button', { type: 'button', onClick: openNew, disabled: !remote, style: Object.assign({}, btnPrim, isMobile ? btnPrimMob : {}) }, '添加主机'),
+          React.createElement('button', { type: 'button', onClick: toggleAliases, disabled: !remote, style: Object.assign({}, btnStyle, isMobile ? mobileBtnStyle : {}) }, '从 ~/.ssh/config 导入'),
         ),
         showAliases
           ? React.createElement('div', { style: { border: '1px solid ' + borderColor, borderRadius: 6, padding: 10, marginBottom: 12 } },
@@ -334,18 +401,19 @@ window.__ModuleLoader__.load({
                     function () { doTest(machine) },
                     function () { openEdit(machine) },
                     function () { doDelete(machine) },
+                    isMobile,
                   )
                 }),
               ),
         deleteTarget !== null
-          ? React.createElement('div', { style: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 } },
-              React.createElement('div', { style: { background: 'var(--dsw-alias-bg, #1c1c1c)', border: '1px solid ' + borderColor, borderRadius: 8, padding: 16, width: 440, maxWidth: '90vw', color: 'var(--dsw-alias-text, #ddd)' } },
+          ? React.createElement('div', { style: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000, padding: 16 } },
+              React.createElement('div', { style: { background: modalBg, border: '1px solid ' + borderColor, borderRadius: 8, padding: isMobile ? 14 : 16, width: 440, maxWidth: '100%', color: modalText } },
                 React.createElement('div', { style: { fontWeight: 600, fontSize: 15, marginBottom: 10 } }, '删除主机'),
                 React.createElement('p', { style: { margin: '0 0 12px', lineHeight: 1.6 } },
                   '确定删除主机「' + (deleteTarget.alias || deleteTarget.host) + '」吗？（远端数据不受影响）'),
-                React.createElement('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
-                  React.createElement('button', { type: 'button', onClick: closeDelete, disabled: deleting, style: btnStyle }, '取消'),
-                  React.createElement('button', { type: 'button', onClick: confirmDelete, disabled: deleting, style: Object.assign({}, btnStyle, { background: dangerColor, color: '#fff', borderColor: dangerColor }) }, deleting ? '删除中…' : '删除'),
+                React.createElement('div', { style: Object.assign({ display: 'flex', gap: 8, justifyContent: 'flex-end' }, isMobile ? { flexDirection: 'column' } : {}) },
+                  React.createElement('button', { type: 'button', onClick: closeDelete, disabled: deleting, style: Object.assign({}, btnStyle, isMobile ? mobileBtnStyle : {}) }, '取消'),
+                  React.createElement('button', { type: 'button', onClick: confirmDelete, disabled: deleting, style: isMobile ? btnDangerMob : btnDanger }, deleting ? '删除中…' : '删除'),
                 ),
               ),
             )
@@ -353,22 +421,33 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function MachineRow(machine, result, open, onToggle, onTest, onEdit, onDelete) {
+    function MachineRow(machine, result, open, onToggle, onTest, onEdit, onDelete, isMobile) {
       var summary = [machine.alias || '(未命名)']
       if (machine.host) summary.push(machine.host)
       if (machine.user) summary.push('@' + machine.user)
       if (machine.port) summary.push(':' + machine.port)
+      var mobileBtn = isMobile ? Object.assign({}, mobileBtnStyle) : btnStyle
+      var dangerBtn = isMobile ? btnDangerMob : btnDanger
+      function action(label, handler, style) {
+        return React.createElement('button', { type: 'button', onClick: function (e) { e.stopPropagation(); handler() }, style: style }, label)
+      }
+      var testBtn = action('测试连接', onTest, mobileBtn)
+      var editBtn = action('编辑', onEdit, mobileBtn)
+      var deleteBtn = action('删除', onDelete, dangerBtn)
       return React.createElement(
         'div',
         { style: { borderTop: '1px solid ' + borderColor, padding: '8px 0' } },
         React.createElement('div', { onClick: onToggle, style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' } },
-          React.createElement('span', { style: { color: 'var(--dsw-alias-label-secondary, #888)', width: 16, flexShrink: 0 } }, open ? '▾' : '▸'),
+          React.createElement('span', { style: { color: '#8b8f98', width: 16, flexShrink: 0 } }, open ? '▾' : '▸'),
           React.createElement('span', { style: Object.assign({}, monoStyle, { fontWeight: 600, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }) }, summary.join(' ')),
           React.createElement('span', { style: { flex: 1 } }),
-          React.createElement('button', { type: 'button', onClick: function (e) { e.stopPropagation(); onTest() }, style: btnStyle }, '测试连接'),
-          React.createElement('button', { type: 'button', onClick: function (e) { e.stopPropagation(); onEdit() }, style: btnStyle }, '编辑'),
-          React.createElement('button', { type: 'button', onClick: function (e) { e.stopPropagation(); onDelete() }, style: btnStyle }, '删除'),
+          isMobile ? null : testBtn,
+          isMobile ? null : editBtn,
+          isMobile ? null : deleteBtn,
         ),
+        isMobile
+          ? React.createElement('div', { style: { display: 'flex', gap: 8, marginTop: 6, paddingLeft: 24, flexWrap: 'wrap' } }, testBtn, editBtn, deleteBtn)
+          : null,
         React.createElement('div', { style: { display: 'flex', gap: 6, marginTop: 4, flexWrap: 'wrap', paddingLeft: 24 } },
           machine.identityFile
             ? React.createElement('span', { title: '私钥：' + machine.identityFile, style: chipStyle }, '私钥 ' + pathBasename(machine.identityFile))
@@ -403,6 +482,7 @@ window.__ModuleLoader__.load({
       })
       var values = valuesState[0]
       var setValues = valuesState[1]
+      var isMobile = useIsMobile()
 
       function set(field) {
         return function (e) {
@@ -420,13 +500,15 @@ window.__ModuleLoader__.load({
       function field(label, name, type, placeholder) {
         return React.createElement('div', { style: { marginBottom: 8 } },
           React.createElement('div', { style: labelStyle }, label),
-          React.createElement('input', { type: type || 'text', value: values[name], onChange: set(name), placeholder: placeholder || '', style: inputStyle }),
+          React.createElement('input', { type: type || 'text', value: values[name], onChange: set(name), placeholder: placeholder || '', style: isMobile ? mobileInputStyle : inputStyle }),
         )
       }
 
+      var formBtn = isMobile ? mobileBtnStyle : btnStyle
+      var formBtnPrim = isMobile ? btnPrimMob : btnPrim
       return React.createElement(
         'form',
-        { onSubmit: submit, style: { border: '1px solid ' + borderColor, borderRadius: 6, padding: 12, marginBottom: 12 } },
+        { onSubmit: submit, style: { border: '1px solid ' + borderColor, borderRadius: 6, padding: isMobile ? 10 : 12, marginBottom: 12 } },
         React.createElement('div', { style: { fontWeight: 600, marginBottom: 8 } }, props.form.isNew ? '添加主机' : '编辑主机'),
         field('别名（alias）', 'alias', 'text', '如 dev'),
         field('主机地址（host）', 'host', 'text', '如 192.168.1.10 或 example.com'),
@@ -435,9 +517,9 @@ window.__ModuleLoader__.load({
         field('私钥路径（identityFile）', 'identityFile', 'text', '如 ~/.ssh/id_rsa，留空用默认密钥'),
         field('密码（password）', 'password', 'password', props.form.isNew ? '可选' : '留空保持不变，输入则替换'),
         field('私钥口令（passphrase）', 'passphrase', 'password', props.form.isNew ? '可选' : '留空保持不变'),
-        React.createElement('div', { style: { display: 'flex', gap: 8, marginTop: 4 } },
-          React.createElement('button', { type: 'submit', style: btnStyle }, '保存'),
-          React.createElement('button', { type: 'button', onClick: props.onCancel, style: btnStyle }, '取消'),
+        React.createElement('div', { style: Object.assign({ display: 'flex', gap: 8, marginTop: 4 }, isMobile ? { flexDirection: 'column' } : {}) },
+          React.createElement('button', { type: 'submit', style: formBtnPrim }, '保存'),
+          React.createElement('button', { type: 'button', onClick: props.onCancel, style: formBtn }, '取消'),
         ),
       )
     }
@@ -477,7 +559,7 @@ window.__ModuleLoader__.load({
         background: hover ? 'rgba(127,127,127,0.16)' : 'transparent',
         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
         fontSize: 13,
-        color: entry.dir ? 'var(--dsw-alias-text, #ddd)' : 'var(--dsw-alias-label-secondary, #888)',
+        color: entry.dir ? 'inherit' : 'rgba(232,232,232,0.55)',
       }
       return React.createElement(
         'div',
@@ -490,7 +572,7 @@ window.__ModuleLoader__.load({
         },
         React.createElement('span', { style: { width: 18, textAlign: 'center', flexShrink: 0 } }, entry.dir ? '📁' : '📄'),
         React.createElement('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, entry.name),
-        entry.dir ? React.createElement('span', { style: { color: 'var(--dsw-alias-label-secondary, #888)', flexShrink: 0 } }, '/') : null,
+        entry.dir ? React.createElement('span', { style: { color: '#8b8f98', flexShrink: 0 } }, '/') : null,
       )
     }
 
@@ -527,6 +609,7 @@ window.__ModuleLoader__.load({
       var pathInputState = React.useState('')
       var pathInput = pathInputState[0]
       var setPathInput = pathInputState[1]
+      var isMobile = useIsMobile()
 
       // Reset per open edge, then load machines.
       React.useEffect(function () {
@@ -636,20 +719,20 @@ window.__ModuleLoader__.load({
         { style: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 } },
         React.createElement(
           'div',
-          { style: { background: 'var(--dsw-alias-bg, #1c1c1c)', border: '1px solid ' + borderColor, borderRadius: 8, padding: 16, width: 560, maxWidth: '92vw', maxHeight: '82vh', overflow: 'auto', color: 'var(--dsw-alias-text, #ddd)' } },
+          { className: 'dsh-rw-btn', style: { background: modalBg, border: '1px solid ' + borderColor, borderRadius: 8, padding: isMobile ? 14 : 16, width: 560, maxWidth: '92vw', maxHeight: '82vh', overflow: 'auto', color: modalText } },
           React.createElement('div', { style: { display: 'flex', alignItems: 'center', marginBottom: 12 } },
             React.createElement('span', { style: { fontWeight: 600, fontSize: 15 } }, '打开文件夹'),
             React.createElement('span', { style: { flex: 1 } }),
-            React.createElement('button', { type: 'button', onClick: onCancel, style: btnStyle }, '取消'),
+            React.createElement('button', { type: 'button', onClick: onCancel, style: isMobile ? mobileBtnStyle : btnStyle }, '取消'),
           ),
           React.createElement('div', { style: { display: 'flex', gap: 8, marginBottom: 12 } },
-            React.createElement('button', { type: 'button', onClick: function () { setMode('local') }, style: Object.assign({}, btnStyle, mode === 'local' ? { border: '2px solid ' + successColor } : {}) }, '本地文件夹'),
-            React.createElement('button', { type: 'button', onClick: function () { setMode('remote') }, style: Object.assign({}, btnStyle, mode === 'remote' ? { border: '2px solid ' + successColor } : {}) }, '远程目录'),
+            React.createElement('button', { type: 'button', onClick: function () { setMode('local') }, style: Object.assign({}, btnStyle, isMobile ? { flex: 1 } : {}, isMobile ? mobileBtnStyle : {}, mode === 'local' ? { background: '#6e56cf', color: '#fff', border: '1px solid transparent' } : {}) }, '本地文件夹'),
+            React.createElement('button', { type: 'button', onClick: function () { setMode('remote') }, style: Object.assign({}, btnStyle, isMobile ? { flex: 1 } : {}, isMobile ? mobileBtnStyle : {}, mode === 'remote' ? { background: '#6e56cf', color: '#fff', border: '1px solid transparent' } : {}) }, '远程目录'),
           ),
           mode === 'local'
             ? React.createElement('div', {},
                 React.createElement('p', { style: { margin: '0 0 12px' } }, '在本机打开系统文件夹选择器，选取一个本地目录作为工作区。'),
-                React.createElement('button', { type: 'button', onClick: doLocal, disabled: localPicking || busy, style: btnStyle }, localPicking ? '等待选择…' : '选择本地文件夹'),
+                React.createElement('button', { type: 'button', onClick: doLocal, disabled: localPicking || busy, style: Object.assign({}, btnStyle, isMobile ? { width: '100%' } : {}, isMobile ? mobileBtnStyle : {}) }, localPicking ? '等待选择…' : '选择本地文件夹'),
               )
             : React.createElement('div', {},
                 React.createElement('div', { style: { marginBottom: 8 } }, '选择 SSH 主机（在「设置 → 远程工作区」中配置）：'),
@@ -662,7 +745,7 @@ window.__ModuleLoader__.load({
                         var m = machines.find(function (x) { return x.id === id })
                         if (m) pickMachine(m)
                       },
-                      style: Object.assign({}, inputStyle, { marginBottom: 8 }),
+                      style: Object.assign({}, isMobile ? mobileInputStyle : inputStyle, { marginBottom: 8 }),
                     },
                       React.createElement('option', { value: '' }, '选择主机…'),
                       machines.map(function (m) {
@@ -671,7 +754,7 @@ window.__ModuleLoader__.load({
                     ),
                 selected
                   ? React.createElement('div', { style: { border: '1px solid ' + borderColor, borderRadius: 6, padding: 10 } },
-                      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 } },
+                      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' } },
                         React.createElement('input', {
                           type: 'text',
                           value: pathInput,
@@ -679,10 +762,12 @@ window.__ModuleLoader__.load({
                           onKeyDown: function (e) { if (e.key === 'Enter') jumpTo() },
                           placeholder: '输入绝对路径，或 ~ 回到主目录',
                           spellCheck: false,
-                          style: Object.assign({}, monoStyle, { flex: 1, minWidth: 0, padding: '5px 8px', fontSize: 13, boxSizing: 'border-box' }),
+                          style: Object.assign({}, monoStyle, isMobile
+                            ? { flex: '1 1 100%', minWidth: 0, padding: '9px 8px', fontSize: 16, boxSizing: 'border-box' }
+                            : { flex: 1, minWidth: 0, padding: '5px 8px', fontSize: 13, boxSizing: 'border-box' }),
                         }),
-                        React.createElement('button', { type: 'button', onClick: jumpTo, disabled: !browse || browse.loading, style: btnStyle }, '跳转'),
-                        React.createElement('button', { type: 'button', onClick: goUp, disabled: !browse || browse.loading || !browse.path || browse.path === '/', style: btnStyle }, '上一级'),
+                        React.createElement('button', { type: 'button', onClick: jumpTo, disabled: !browse || browse.loading, style: Object.assign({}, btnStyle, isMobile ? { flex: 1 } : {}, isMobile ? mobileBtnStyle : {}) }, '跳转'),
+                        React.createElement('button', { type: 'button', onClick: goUp, disabled: !browse || browse.loading || !browse.path || browse.path === '/', style: Object.assign({}, btnStyle, isMobile ? { flex: 1 } : {}, isMobile ? mobileBtnStyle : {}) }, '上一级'),
                       ),
                       browse && browse.loading
                         ? React.createElement('div', { style: labelStyle }, '加载中…')
@@ -701,7 +786,7 @@ window.__ModuleLoader__.load({
                               )
                             : null,
                       React.createElement('div', { style: { marginTop: 10 } },
-                        React.createElement('button', { type: 'button', onClick: doOpenRemote, disabled: opening || busy || (browse && browse.loading), style: btnStyle },
+                        React.createElement('button', { type: 'button', onClick: doOpenRemote, disabled: opening || busy || (browse && browse.loading), style: Object.assign({}, btnPrim, isMobile ? { width: '100%' } : {}, isMobile ? btnPrimMob : {}) },
                           opening ? '打开中…' : '打开此目录'),
                       ),
                     )
@@ -714,6 +799,20 @@ window.__ModuleLoader__.load({
     exports.inject = ['slots', 'remote', 'uiWorkspace']
 
     exports.apply = function apply(ctx) {
+      // Inject a small set of theme-aware control styles (hover / focus /
+      // disabled). Backgrounds are deliberately left to the theme so buttons
+      // adapt to dark and light instead of forcing a hard-coded box.
+      if (typeof document !== 'undefined' && document.head && !document.getElementById('dsh-rw-controls')) {
+        var styleEl = document.createElement('style')
+        styleEl.id = 'dsh-rw-controls'
+        styleEl.textContent = [
+          '.dsh-rw-btn button:disabled{opacity:.5;cursor:not-allowed}',
+          '.dsh-rw-btn button:focus-visible{outline:2px solid #6e56cf;outline-offset:2px}',
+          '.dsh-rw-btn input:focus,.dsh-rw-btn select:focus{box-shadow:0 0 0 1px #6e56cf}',
+        ].join('\n')
+        document.head.appendChild(styleEl)
+      }
+
       var mount = ctx.remote.$mount({ package: PACKAGE, descriptors: INVOCATIONS })
       var getRemote = function () { return ctx.get('remote.' + NAMESPACE) }
 
