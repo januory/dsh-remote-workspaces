@@ -53,6 +53,12 @@ $DSH_HOME/remote-workspaces/
 dsh plugin --profile web add github:januory/dsh-remote-workspaces
 ```
 
+发布到 npm 后，也可以直接安装已发布的包：
+
+```sh
+dsh plugin --profile web add dsh-remote-workspaces
+```
+
 从源码安装：
 
 ```sh
@@ -68,8 +74,10 @@ dsh plugin --profile web add .
 卸载：
 
 ```sh
-dsh plugin --profile web remove remote-workspaces
+dsh plugin --profile web remove dsh-remote-workspaces
 ```
+
+> 维护者注：npm 包名现为 `dsh-remote-workspaces`（早期 git 安装时的包名是 `remote-workspaces`）；旧安装请先 `dsh plugin --profile <name> remove remote-workspaces`，再按新名安装。
 
 ## 使用
 
@@ -118,6 +126,24 @@ pnpm test
 
 ```sh
 pnpm test:integration
+```
+
+## 发布（维护者）
+
+发布完全手动触发：GitHub Actions → **release** → **Run workflow**，输入版本增量（`patch` / `minor` / `major`，或直接写完整版本号如 `0.2.0`）。工作流会自动执行：`npm version` 改版本号并打 `vX.Y.Z` tag → 推送 `main` 与 tag → 跑单元测试（`npm test`）→ `npm publish`（带 provenance）→ 用 `--generate-notes` 创建 GitHub Release。
+
+前提：在仓库 **Settings → Secrets and variables → Actions** 中配置名为 `NPM_TOKEN` 的 secret（npm automation token，或对该包有 publish 权限的 granular token）；发布账号须是持有该包名的 npm 用户。
+
+等价的手工流程：
+
+```sh
+npm login
+
+npm version patch -m 'chore: release v%s'
+
+git push origin main --tags
+
+npm publish --provenance
 ```
 
 ## 开源协议

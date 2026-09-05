@@ -4,5 +4,8 @@ node_modules/
 *.log
 *.tmp
 
+# npm lockfile (repo is pnpm-managed; the release workflow never commits it)
+package-lock.json
+
 # Local design docs (never committed)
 docs/

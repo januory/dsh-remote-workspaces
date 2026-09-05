@@ -1,10 +1,13 @@
 {
-  "name": "remote-workspaces",
+  "name": "dsh-remote-workspaces",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "Open folders on remote hosts over SSH as DeepSeek Harness workspaces — a non-invasive DSH bundle.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/januory/dsh-remote-workspaces.git"
+  },
   "main": "./src/index.js",
   "exports": {
     ".": "./src/index.js",

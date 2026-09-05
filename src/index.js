@@ -19,7 +19,7 @@ export { loadMachines, sanitizeMachine, upsertMachine, removeMachine, machinesPa
 export { registerAnchor, unregisterAnchor, findByCwd, loadAnchors } from './registry.js'
 
 /**
- * Host half of the SSH remote workspace bundle (`remote-workspaces`).
+ * Host half of the SSH remote workspace bundle (`dsh-remote-workspaces`).
  *
  * Publishes the routing `ctx.fs` and `ctx.shell` (local half sandboxed through
  * the harness's policy/sandbox/subprocess services; remote half SFTP/ssh2 exec),
@@ -30,12 +30,12 @@ export { registerAnchor, unregisterAnchor, findByCwd, loadAnchors } from './regi
  * registry — all file/command I/O then lands on the remote, never the anchor).
  */
 
-export const name = 'remote-workspaces'
+export const name = 'dsh-remote-workspaces'
 
 // ---------------------------------------------------------------------------
 // Remote contract. The client half (src/client.js) keeps an identical copy.
 // ---------------------------------------------------------------------------
-const PACKAGE = 'remote-workspaces'
+const PACKAGE = 'dsh-remote-workspaces'
 const NAMESPACE = 'remoteWorkspaces'
 
 const JSON_CODEC = Object.freeze({
@@ -296,7 +296,7 @@ export function apply(ctx) {
     const systemPrompt = sctx.get('systemPrompt')
     if (systemPrompt === undefined) return
     systemPrompt.section({
-      name: 'remote-workspaces:notice',
+      name: 'dsh-remote-workspaces:notice',
       order: 10,
       text: (context) => {
         const cwd = context.agent?.session?.header?.cwd

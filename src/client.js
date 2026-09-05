@@ -21,7 +21,7 @@
 // Remote contract (must match src/index.js). Parameters carry strict codecs
 // with a pass-through `parse` (the client `$mount` face rejects `src-json`).
 // ---------------------------------------------------------------------------
-var PACKAGE = 'remote-workspaces'
+var PACKAGE = 'dsh-remote-workspaces'
 var NAMESPACE = 'remoteWorkspaces'
 
 var JSON_CODEC = Object.freeze({
@@ -720,7 +720,7 @@ window.__ModuleLoader__.load({
       // Settings section: machines + open remote workspaces (grouped by host).
       ctx.slots.inject('settings.section', function () {
         return ctx.slots.register(
-          { name: 'settings.section', id: 'remote-workspaces', order: 100, label: '远程工作区' },
+          { name: 'settings.section', id: 'dsh-remote-workspaces', order: 100, label: '远程工作区' },
           function () {
             return React.createElement(SshWorkspaceSection, {
               mount: mount,

@@ -52,6 +52,12 @@ Install from this repository:
 dsh plugin --profile web add github:januory/dsh-remote-workspaces
 ```
 
+Once published to npm, install the released package directly:
+
+```sh
+dsh plugin --profile web add dsh-remote-workspaces
+```
+
 Install from source:
 
 ```sh
@@ -67,8 +73,10 @@ dsh plugin --profile web add .
 Remove it with:
 
 ```sh
-dsh plugin --profile web remove remote-workspaces
+dsh plugin --profile web remove dsh-remote-workspaces
 ```
+
+> Maintainer note: the npm package name is now `dsh-remote-workspaces` (the early git install used `remote-workspaces`); older installs must first run `dsh plugin --profile <name> remove remote-workspaces`, then install under the new name.
 
 ## Usage
 
@@ -116,6 +124,24 @@ The integration suite exercises a real SSH host and expects the machine registry
 
 ```sh
 pnpm test:integration
+```
+
+## Publishing (maintainers)
+
+Releases are fully manual: GitHub Actions → **release** → **Run workflow**, entering a version bump (`patch` / `minor` / `major`, or an explicit version like `0.2.0`). The workflow then: bumps the version and creates the `vX.Y.Z` tag via `npm version`, pushes `main` and the tag, runs the unit tests (`npm test`), publishes to npm with provenance (`npm publish --provenance`), and creates a GitHub Release with `--generate-notes`.
+
+Prerequisites: configure an `NPM_TOKEN` secret in **Settings → Secrets and variables → Actions** (an npm automation token, or a granular token with publish permission on the package); the publishing account must be the npm user owning the package name.
+
+Equivalent manual flow:
+
+```sh
+npm login
+
+npm version patch -m 'chore: release v%s'
+
+git push origin main --tags
+
+npm publish --provenance
 ```
 
 ## License
