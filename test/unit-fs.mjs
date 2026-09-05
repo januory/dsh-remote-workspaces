@@ -19,7 +19,18 @@ function check(label, cond, detail = '') {
   const root = mkdtempSync(join(tmpdir(), 'root-'))
   const policy = { mode: 'workspace-write', workspaceRoot: root }
   const roots = writableRoots(policy)
-  check('workspace-write roots include workspaceRoot', roots.length >= 3 && (await isPathUnder(root, roots[0])))
+  // On POSIX, os.tmpdir() IS /tmp, so the three inputs dedupe to two distinct
+  // roots; on Windows they stay three. Assert the count matches the distinct
+  // input set and that the (canonicalized) workspace root is actually in it.
+  const expected = new Set([root, '/tmp', tmpdir()]).size
+  let includesRoot = false
+  for (const r of roots) {
+    if (await isPathUnder(r, root)) {
+      includesRoot = true
+      break
+    }
+  }
+  check('workspace-write roots include workspaceRoot', roots.length === expected && includesRoot)
   check('read-only roots empty', writableRoots({ mode: 'read-only', workspaceRoot: root }).length === 0)
   check('danger-full-access roots empty', writableRoots({ mode: 'danger-full-access', workspaceRoot: root }).length === 0)
 
