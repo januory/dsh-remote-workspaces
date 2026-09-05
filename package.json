@@ -6,7 +6,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/januory/dsh-remote-workspaces.git"
+    "url": "git+https://github.com/januory/dsh-remote-workspaces.git"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "main": "./src/index.js",
   "exports": {
