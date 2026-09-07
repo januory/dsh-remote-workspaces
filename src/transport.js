@@ -113,9 +113,15 @@ export function profileCacheKey({ host, user, port }) {
 
 /**
  * Detect a target's OS family and default exec shell without parsing
- * localized output: `uname -s` proves a POSIX shell; `cmd /c ver` proves
- * Windows (it runs from cmd, PowerShell and Git Bash defaults alike); a
+ * localized output: `uname -s` proves a POSIX shell; the bare `ver` builtin
+ * proves a cmd-default Windows host; a quoted nested `cmd /c "ver"` proves
+ * Windows under a PowerShell default (PowerShell itself has no `ver`); a
  * `$PSVersionTable` expression then tells cmd from PowerShell as the default.
+ *
+ * Quoting matters on real cmd-default Windows hosts: OpenSSH wraps the exec
+ * payload for cmd.exe in a way that mangles inner unquoted spaces — `cmd /c
+ * ver` arrives as `ver"` and fails, while a bare single token (`ver`) and a
+ * quoted inner command (`cmd /c "ver"`) both pass (verified on a real host).
  */
 export async function probeRemoteProfile(client) {
   const uname = await client.run('uname -s')
@@ -123,15 +129,29 @@ export async function probeRemoteProfile(client) {
     const os = (uname.stdout ?? '').trim().toLowerCase()
     return { family: 'posix', os: os.startsWith('darwin') ? 'darwin' : 'linux', shell: 'posix' }
   }
-  const ver = await client.run('cmd /c ver')
-  if (ver.ok && /windows/i.test(ver.stdout ?? '')) {
+  const ver = await client.run('ver')
+  if (ver.ok) return { family: 'windows', os: 'windows', shell: 'cmd' }
+  const nested = await client.run('cmd /c "ver"')
+  if (nested.ok && /windows/i.test(nested.stdout ?? '')) {
     const ps = await client.run('$PSVersionTable.PSVersion.ToString()')
     return ps.ok
       ? { family: 'windows', os: 'windows', shell: 'powershell' }
       : { family: 'windows', os: 'windows', shell: 'cmd' }
   }
+  const ps = await client.run('$PSVersionTable.PSVersion.ToString()')
+  if (ps.ok) return { family: 'windows', os: 'windows', shell: 'powershell' }
   return { family: 'unknown', os: 'unknown', shell: 'unknown' }
 }
+
+/**
+ * Error text used whenever a command cannot run because the remote profile
+ * probe failed (family 'unknown'). Explicit instead of guessing a dialect:
+ * sending a POSIX `cd 'x' || exit 1` script to a Windows/cmd host produces the
+ * misleading "文件名、目录名或卷标语法不正确" (Win32 123) failure, and the
+ * other way around is equally wrong — so callers refuse loudly.
+ */
+export const PROBE_UNKNOWN_MSG =
+  'cannot determine the remote shell type (exec probe failed); command not executed. Check the host side: the account home/profile directory must exist, the OpenSSH DefaultShell must be valid, and the exec channel itself must be usable.'
 
 /** Encode a PowerShell script for quote-safe transport through cmd.exe.
  *
@@ -162,7 +182,15 @@ export function psCommandEnvelope(script) {
  * text (no CLIXML records).
  */
 export function buildExecScript(profile, command, cwd) {
-  if (profile === undefined || profile.family !== 'windows') {
+  if (profile === undefined) {
+    return cwd ? `cd ${shellQuote(cwd)} || exit 1\n${command}` : command
+  }
+  if (profile.family === 'unknown') {
+    // Never guess: a POSIX script against a Windows/cmd host dies on the first
+    // line with Win32 123-style errors and never reaches the command.
+    throw new Error(PROBE_UNKNOWN_MSG)
+  }
+  if (profile.family !== 'windows') {
     return cwd ? `cd ${shellQuote(cwd)} || exit 1\n${command}` : command
   }
   const script = [
@@ -362,6 +390,9 @@ export class SshClient {
    */
   async execShell(command, { cwd, timeoutMs = 60000, stdoutMaxBytes = 64000, stderrMaxBytes = 64000, stdin, signal } = {}) {
     const profile = await this.profile()
+    if (profile.family === 'unknown') {
+      return { ok: false, error: PROBE_UNKNOWN_MSG }
+    }
     const script = buildExecScript(profile, command, cwd)
     return await new Promise((resolve) => {
       const conn = new Client()
@@ -480,6 +511,15 @@ export class SshClient {
    */
   async execStream(command, { cwd, signal, stdoutMaxBytes = 16 * 1024 * 1024, stderrMaxBytes = 16 * 1024 * 1024 } = {}) {
     const profile = await this.profile()
+    if (profile.family === 'unknown') {
+      // Same explicit refusal as execShell: no dialect to build the script in.
+      return {
+        readOut: () => ({ delta: '', lossy: false }),
+        readErr: () => ({ delta: '', lossy: false }),
+        exit: Promise.resolve({ error: PROBE_UNKNOWN_MSG }),
+        terminate() {},
+      }
+    }
     const windows = profile.family === 'windows'
     const ssh = this
     // The marker runs FIRST inside the same remote shell that owns the exec
@@ -604,14 +644,18 @@ export class SshClient {
 
   /**
    * Cached remote execution profile ({ family, os, shell }); probed once per
-   * target and reused for the process lifetime.
+   * target and reused for the process lifetime. FAILED probes (family
+   * 'unknown') are never cached, so the next call re-probes: a transient
+   * failure or a host-side fix is picked up without restarting the process.
    */
   async profile() {
     const key = profileCacheKey(this)
     let profile = REMOTE_PROFILE_CACHE.get(key)
     if (profile === undefined) {
       profile = await probeRemoteProfile(this)
-      REMOTE_PROFILE_CACHE.set(key, profile)
+      if (profile.family === 'posix' || profile.family === 'windows') {
+        REMOTE_PROFILE_CACHE.set(key, profile)
+      }
     }
     return profile
   }

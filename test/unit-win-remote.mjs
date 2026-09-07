@@ -5,7 +5,7 @@
  *
  * All paths are neutral fixtures (never a real host's drive layout).
  */
-import { toWinPath, psQuote, psCommandEnvelope, buildExecScript, stripPsProgressClixml, crlfToLf, createCrlfToLf, shellQuote } from '../src/transport.js'
+import { toWinPath, psQuote, psCommandEnvelope, buildExecScript, stripPsProgressClixml, crlfToLf, createCrlfToLf, shellQuote, probeRemoteProfile } from '../src/transport.js'
 import { remoteRgCommand } from '../src/search.js'
 
 const results = []
@@ -46,8 +46,36 @@ check('psQuote escapes apostrophe', psQuote("it's") === `'it''s'`)
   check('posix keeps cd && form', posix === `cd '/data/x' || exit 1\necho hi`, posix)
   const posixNoCwd = buildExecScript({ family: 'posix', os: 'linux', shell: 'posix' }, 'echo hi', undefined)
   check('posix without cwd is raw', posixNoCwd === 'echo hi')
-  const unknown = buildExecScript({ family: 'unknown' }, 'echo hi', '/data/x')
-  check('unknown family falls back to posix form', unknown === `cd '/data/x' || exit 1\necho hi`)
+  let unknownThrew = false
+  try {
+    buildExecScript({ family: 'unknown' }, 'echo hi', '/data/x')
+  } catch (e) {
+    unknownThrew = /cannot determine the remote shell type/i.test(e.message)
+  }
+  check('unknown family throws instead of building a POSIX script', unknownThrew)
+}
+
+// --- probeRemoteProfile (cmd-aware detection chain, mocked client) ----------
+{
+  const runOf = (map) => async (cmd) => map[cmd] ?? { ok: false, exitCode: 1, stdout: '', stderr: '' }
+  const probe = async (map) => probeRemoteProfile({ run: runOf(map) })
+
+  const posix = await probe({ 'uname -s': { ok: true, stdout: 'Linux' } })
+  check('probe posix linux', posix.family === 'posix' && posix.os === 'linux' && posix.shell === 'posix')
+  const darwin = await probe({ 'uname -s': { ok: true, stdout: 'Darwin' } })
+  check('probe posix darwin', darwin.family === 'posix' && darwin.os === 'darwin')
+  const winCmd = await probe({ 'ver': { ok: true, stdout: 'Microsoft Windows [Version 10.0.20348]' } })
+  check('probe windows/cmd via bare ver', winCmd.family === 'windows' && winCmd.shell === 'cmd', JSON.stringify(winCmd))
+  const winPs = await probe({
+    'ver': { ok: false, exitCode: 1 },
+    'cmd /c "ver"': { ok: true, stdout: 'Microsoft Windows [Version 10.0.26200]' },
+    '$PSVersionTable.PSVersion.ToString()': { ok: true, stdout: '5.1' },
+  })
+  check('probe windows/powershell via cmd /c "ver" + PSVersionTable', winPs.family === 'windows' && winPs.shell === 'powershell', JSON.stringify(winPs))
+  const winPsNoCmd = await probe({ '$PSVersionTable.PSVersion.ToString()': { ok: true, stdout: '7.4' } })
+  check('probe windows/powershell when cmd is absent', winPsNoCmd.family === 'windows' && winPsNoCmd.shell === 'powershell', JSON.stringify(winPsNoCmd))
+  const unk = await probe({})
+  check('probe unknown when every step fails', unk.family === 'unknown' && unk.shell === 'unknown')
 }
 
 {

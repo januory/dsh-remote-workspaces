@@ -9,7 +9,7 @@
  * harness's `bash-sandbox`/`pwsh-sandbox` apply).
  */
 
-import { SshClient, shellQuote } from './transport.js'
+import { SshClient, shellQuote, PROBE_UNKNOWN_MSG } from './transport.js'
 import { isRemoteCwd, parseSshUri } from './ssh-uri.js'
 import { findByCwd } from './registry.js'
 import { lstatSync } from 'node:fs'
@@ -247,6 +247,13 @@ export class SshShellExecutor {
       },
       done: (async () => {
         const profile = await client.profile()
+        if (profile.family === 'unknown') {
+          // Never run the POSIX nohup launcher against an undetected host (a
+          // Windows/cmd host would die on the `cd '…'` line with Win32 123).
+          spawnError = new Error(PROBE_UNKNOWN_MSG)
+          proc.status = 'killed'
+          return
+        }
         if (profile.family === 'windows') {
           // No nohup-style detach exists on Windows remotes, and closing the
           // channel alone does NOT reap the remote tree (verified) - so the
@@ -282,6 +289,11 @@ export class SshShellExecutor {
           const outcome = await ctl.exit
           merge()
           if (proc.status === 'running') proc.status = 'completed'
+          if (outcome.error !== undefined) {
+            spawnError = new Error(outcome.error)
+            proc.status = 'killed'
+            return
+          }
           proc.exitCode = typeof outcome.exitCode === 'number' ? outcome.exitCode : null
           return
         }

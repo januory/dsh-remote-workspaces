@@ -131,8 +131,17 @@ function kickOsBackfill(cwd) {
       const profile = await client.profile()
       if (profile !== undefined && (profile.family === 'posix' || profile.family === 'windows')) {
         updateAnchorOs(hit.anchorPath, { family: profile.family, os: profile.os, shell: profile.shell })
+        return
       }
-    } catch { /* keep the row without os */ }
+      // Unknown / undetectable: leave the dedupe queue so the NEXT prompt
+      // render re-kicks the probe (failed probes are not cached, so a later
+      // attempt really does re-probe instead of reusing a stale unknown).
+      OS_BACKFILL_QUEUED.delete(hit.anchorPath)
+      console.warn(`[dsh-remote-workspaces] os backfill probe failed for ${hit.host} (family unknown); will retry on next render`)
+    } catch (error) {
+      OS_BACKFILL_QUEUED.delete(hit.anchorPath)
+      console.warn(`[dsh-remote-workspaces] os backfill probe errored for ${hit.host}: ${messageOf(error)}`)
+    }
   })()
 }
 
