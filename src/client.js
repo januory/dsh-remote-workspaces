@@ -809,6 +809,14 @@ window.__ModuleLoader__.load({
           '.dsh-rw-btn button:disabled{opacity:.5;cursor:not-allowed}',
           '.dsh-rw-btn button:focus-visible{outline:2px solid #6e56cf;outline-offset:2px}',
           '.dsh-rw-btn input:focus,.dsh-rw-btn select:focus{box-shadow:0 0 0 1px #6e56cf}',
+          // The host chooser sits inside the always-dark modal (modalBg #1f1f21,
+          // text #e8e8e8), but a native <select> renders its option popup on the
+          // OS theme. Without dark color-scheme the light inherited text lands on
+          // a light popup and the host list is unreadable. Force the popup dark,
+          // and give the options an explicit light-on-dark fallback.
+          '.dsh-rw-btn select{color-scheme:dark}',
+          '.dsh-rw-btn select option{color:#e8e8e8;background:#1f1f21}',
+          '.dsh-rw-btn select option:checked{background:#6e56cf;color:#fff}',
         ].join('\n')
         document.head.appendChild(styleEl)
       }
