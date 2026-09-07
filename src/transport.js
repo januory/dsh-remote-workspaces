@@ -58,6 +58,39 @@ export function stripPsProgressClixml(text) {
   return out.join('\n')
 }
 
+/** Whole-text CRLF→LF (Windows remote output normalization). */
+export function crlfToLf(text) {
+  return String(text ?? '').replace(/\r\n/g, '\n')
+}
+
+/**
+ * Streaming CRLF→LF normalizer that carries a trailing `\r` across chunk
+ * boundaries (a `\r\n` pair may be split between two data events). `feed`
+ * returns the normalized fragment; call `flush()` at stream end for a lone
+ * trailing `\r` (isolated CRs are preserved, not folded).
+ */
+export function createCrlfToLf() {
+  let carry = ''
+  return {
+    feed(text) {
+      const s = String(text ?? '')
+      let out = carry + s
+      carry = ''
+      out = out.replace(/\r\n/g, '\n')
+      if (out.endsWith('\r')) {
+        carry = '\r'
+        out = out.slice(0, -1)
+      }
+      return out
+    },
+    flush() {
+      const rest = carry
+      carry = ''
+      return rest
+    },
+  }
+}
+
 /**
  * Exit-code glue appended to every Windows remote script so the channel's
  * exit status mirrors what a POSIX shell reports: the last command's result.
@@ -364,7 +397,10 @@ export class SshClient {
             const aborted = signal !== undefined && signal.aborted
             const stdout = out.output()
             const stderr = errc.output()
-            if (profile.family === 'windows') stderr.text = stripPsProgressClixml(stderr.text)
+            if (profile.family === 'windows') {
+              stderr.text = crlfToLf(stripPsProgressClixml(stderr.text))
+              stdout.text = crlfToLf(stdout.text)
+            }
             finish({
               ok: true,
               exitCode: code,
@@ -481,13 +517,19 @@ export class SshClient {
         target.pos = target.buf.length
         return { delta, lossy: target.lossy }
       }
+      // Normalize Windows CRLF output to LF at the chunk boundary so a \r\n
+      // split across data events still folds (isolated CRs are preserved).
+      const outLf = windows ? createCrlfToLf() : null
+      const errLf = windows ? createCrlfToLf() : null
       // The PID marker is the FIRST stdout line, but the first data chunk may
       // hold only part of it, so buffer head bytes until the line completes.
       let head = ''
       let markerResolved = false
       const onOut = (chunk) => {
-        if (markerResolved) { push(out)(chunk); return }
-        head += String(chunk)
+        const text = outLf === null ? String(chunk) : outLf.feed(chunk)
+        if (text === '') return
+        if (markerResolved) { push(out)(text); return }
+        head += text
         if (windows) {
           const m = /^DWSH_PID=(\d+)\r?\n/.exec(head)
           if (m !== null) {
@@ -515,13 +557,21 @@ export class SshClient {
         push(out)(head)
         head = ''
       }
+      const onErr = (chunk) => {
+        const text = errLf === null ? String(chunk) : errLf.feed(chunk)
+        if (text !== '') push(err)(text)
+      }
       conn.on('ready', () => {
         conn.exec(script, (execError, s) => {
           if (execError) { finish({ error: execError.message }); return }
           stream = s
           s.on('data', onOut)
-          s.stderr.on('data', push(err))
-          s.on('close', (code) => { finish({ exitCode: code }) })
+          s.stderr.on('data', onErr)
+          s.on('close', (code) => {
+            if (outLf !== null) { const rest = outLf.flush(); if (rest !== '') push(out)(rest) }
+            if (errLf !== null) { const rest = errLf.flush(); if (rest !== '') push(err)(rest) }
+            finish({ exitCode: code })
+          })
           s.end()
         })
       })

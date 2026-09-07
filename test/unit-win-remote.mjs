@@ -5,7 +5,7 @@
  *
  * All paths are neutral fixtures (never a real host's drive layout).
  */
-import { toWinPath, psQuote, psCommandEnvelope, buildExecScript, stripPsProgressClixml, shellQuote } from '../src/transport.js'
+import { toWinPath, psQuote, psCommandEnvelope, buildExecScript, stripPsProgressClixml, crlfToLf, createCrlfToLf, shellQuote } from '../src/transport.js'
 import { remoteRgCommand } from '../src/search.js'
 
 const results = []
@@ -77,6 +77,26 @@ check('psQuote escapes apostrophe', psQuote("it's") === `'it''s'`)
   const partial = stripPsProgressClixml('#< CLIXML\r\n<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">\r\n' + plain)
   check('strips unterminated partial CLIXML tail', partial === plain, JSON.stringify(partial))
   check('leaves non-CLIXML text untouched', stripPsProgressClixml(plain) === plain)
+}
+
+// --- CRLF normalization -----------------------------------------------------
+{
+  check('crlfToLf folds CRLF pairs', crlfToLf('a\r\nb\r\n') === 'a\nb\n')
+  check('crlfToLf leaves LF-only text', crlfToLf('a\nb') === 'a\nb')
+  check('crlfToLf keeps a lone CR', crlfToLf('a\rX') === 'a\rX')
+
+  const lf = createCrlfToLf()
+  const first = lf.feed('a\r')
+  const second = lf.feed('\nb')
+  check('stream folds CRLF split across chunks', first + second === 'a\nb', JSON.stringify(first + second))
+  check('stream empty tail chunk is a no-op', lf.feed('') === '')
+
+  const lf2 = createCrlfToLf()
+  const part1 = lf2.feed('x\r\ny')
+  check('stream folds CRLF inside one chunk', part1 === 'x\ny', JSON.stringify(part1))
+  const part2 = lf2.feed('end\r')
+  check('stream holds a trailing CR for flush', part2 === 'end', JSON.stringify(part2))
+  check('stream flush releases the trailing CR', lf2.flush() === '\r')
 }
 
 // --- remoteRgCommand --------------------------------------------------------
