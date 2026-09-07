@@ -34,12 +34,26 @@ function saveAnchors(anchors) {
   writeFileSync(anchorsPath(), JSON.stringify(anchors, null, 2) + '\n', 'utf8')
 }
 
-/** Record an anchor (idempotent by anchorPath). Returns the stored record. */
-export function registerAnchor({ anchorPath, machineId, host, port, user, remotePath }) {
+/** Record an anchor (idempotent by anchorPath). Returns the stored record.
+ * `os` (optional) is the probed remote profile `{ family, os, shell }` used
+ * by prompt/dialect hints; older rows without it are backfilled lazily. */
+export function registerAnchor({ anchorPath, machineId, host, port, user, remotePath, os }) {
   const anchors = loadAnchors()
-  anchors[anchorPath] = { machineId, host, port, user, remotePath, registeredAt: new Date().toISOString() }
+  const rec = { machineId, host, port, user, remotePath, registeredAt: new Date().toISOString() }
+  if (os !== undefined && os !== null) rec.os = os
+  anchors[anchorPath] = rec
   saveAnchors(anchors)
   return anchors[anchorPath]
+}
+
+/** Backfill (or replace) the probed remote profile on an existing anchor row. */
+export function updateAnchorOs(anchorPath, os) {
+  const anchors = loadAnchors()
+  const rec = anchors[anchorPath]
+  if (rec === undefined) return undefined
+  rec.os = os
+  saveAnchors(anchors)
+  return rec
 }
 
 /** Remove one anchor by its local path. */
@@ -73,4 +87,4 @@ export function findByCwd(cwd) {
   return { ...best, remoteSubpath: rel === '' ? '' : rel.split(sep).join('/') }
 }
 
-export default { loadAnchors, registerAnchor, unregisterAnchor, findByCwd, remoteWorkspacesRoot }
+export default { loadAnchors, registerAnchor, unregisterAnchor, updateAnchorOs, findByCwd, remoteWorkspacesRoot }

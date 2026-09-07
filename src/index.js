@@ -4,7 +4,7 @@ import { loadMachines, sanitizeMachine, upsertMachine, removeMachine, machineByI
 import { ensureAnchor } from './anchor.js'
 import { RoutingFileSystem } from './routing-fs.js'
 import { SshShellExecutor } from './shell-exec.js'
-import { registerAnchor, unregisterAnchor, findByCwd } from './registry.js'
+import { registerAnchor, unregisterAnchor, findByCwd, updateAnchorOs } from './registry.js'
 import { applySearchTools } from './search.js'
 
 export { parseSshConfig, expandTilde } from './ssh-config.js'
@@ -109,6 +109,31 @@ function attrsIsDir(st) {
 function clientForRemote(host, user, port) {
   const machine = machineForRemote({ host, port, user })
   return machine ? sshClientFor(machine) : clientForHost(host)
+}
+
+const OS_BACKFILL_QUEUED = new Set()
+
+/**
+ * Lazily backfill the `os` profile on an anchor row that predates B4 (kicked
+ * once per anchor per process, fire-and-forget). Prompt hints re-read the
+ * registry on every render, so the next prompt after the probe sees the OS.
+ */
+function kickOsBackfill(cwd) {
+  if (typeof cwd !== 'string' || cwd === '') return
+  let hit
+  try { hit = findByCwd(cwd) } catch { return }
+  if (hit === undefined || (hit.os && hit.os.family !== undefined)) return
+  if (OS_BACKFILL_QUEUED.has(hit.anchorPath)) return
+  OS_BACKFILL_QUEUED.add(hit.anchorPath)
+  void (async () => {
+    try {
+      const client = clientForRemote(hit.host, hit.user, hit.port)
+      const profile = await client.profile()
+      if (profile !== undefined && (profile.family === 'posix' || profile.family === 'windows')) {
+        updateAnchorOs(hit.anchorPath, { family: profile.family, os: profile.os, shell: profile.shell })
+      }
+    } catch { /* keep the row without os */ }
+  })()
 }
 
 /**
@@ -246,6 +271,16 @@ function remoteWorkspacesService() {
         const rel = path === undefined || path === '' ? '.' : path
         const remotePath = await sftp.realpath(rel)
         const anchorPath = ensureAnchor(machine, remotePath)
+        // Probe the remote profile once so prompt/dialect hints can declare
+        // the actual shell (PowerShell on Windows remotes). Failure to probe
+        // only leaves the hint off — never fails the open.
+        let os
+        try {
+          const profile = await client.profile()
+          if (profile !== undefined && (profile.family === 'posix' || profile.family === 'windows')) {
+            os = { family: profile.family, os: profile.os, shell: profile.shell }
+          }
+        } catch { /* os stays undefined */ }
         registerAnchor({
           anchorPath,
           machineId: machine?.id,
@@ -253,6 +288,7 @@ function remoteWorkspacesService() {
           port: machine?.port ?? null,
           user: machine?.user ?? null,
           remotePath,
+          ...(os !== undefined ? { os } : {}),
         })
         return { ok: true, localDir: anchorPath, remotePath }
       } catch (error) {
@@ -311,6 +347,8 @@ export function apply(ctx) {
         if (typeof cwd !== 'string' || cwd === '') return cwd
         const hit = findByCwd(cwd)
         if (hit === undefined) return cwd
+        // Side effect: backfill the os profile on rows registered before B4.
+        kickOsBackfill(cwd)
         return hit.remoteSubpath === '' ? hit.remotePath : `${hit.remotePath.replace(/\/+$/, '')}/${hit.remoteSubpath}`
       })
     })
@@ -329,8 +367,14 @@ export function apply(ctx) {
         if (typeof cwd !== 'string' || cwd === '') return ''
         const hit = findByCwd(cwd)
         if (hit === undefined) return ''
+        // Side effect: backfill the os profile on rows registered before B4.
+        kickOsBackfill(cwd)
         const host = hit.user ? `${hit.user}@${hit.host}` : hit.host
-        return `Remote workspace over SSH (${host}): file/search tools and shell commands run on the remote host; use relative paths (they route to the remote automatically).`
+        const base = `Remote workspace over SSH (${host}): file/search tools and shell commands run on the remote host; use relative paths (they route to the remote automatically).`
+        if (hit.os?.family === 'windows') {
+          return base + ' The remote shell is PowerShell — write PowerShell syntax (built-in aliases like ls/cat/cd/pwd work; bash-only syntax such as && or 2>/dev/null does not).'
+        }
+        return base
       },
     })
   })
