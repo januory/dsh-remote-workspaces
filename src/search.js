@@ -112,6 +112,13 @@ async function localRg(deps, argv, cwd, signal) {
 }
 
 async function remoteRg(client, argv, remoteCwd, signal) {
+  // ripgrep is a POSIX-world tool: Windows remotes have no `rg` in their
+  // default PATH (and cmd/PowerShell cannot run it). Report an explicit,
+  // actionable error instead of a confusing command-not-found exit.
+  const profile = await client.profile()
+  if (profile.family === 'windows') {
+    throw new Error('grep/glob: Windows 远程主机暂不支持 rg 搜索（远端未安装 ripgrep）')
+  }
   const command = ['rg', ...argv].map(shellQuote).join(' ')
   const result = await client.execShell(command, {
     cwd: remoteCwd,

@@ -244,6 +244,15 @@ export class SshShellExecutor {
         return true
       },
       done: (async () => {
+        // Background jobs need POSIX nohup/tail/kill plumbing; on Windows
+        // remotes there is no POSIX shell to run it in. Fail explicitly
+        // instead of emitting a confusing spawn error from cmd/PowerShell.
+        const profile = await client.profile()
+        if (profile.family === 'windows') {
+          spawnError = new Error('remote background start is not supported on Windows hosts yet')
+          proc.status = 'killed'
+          return
+        }
         const launched = await client.run(launchScript)
         if (!launched.ok) {
           spawnError = new Error((launched.stderr ?? '').trim() || launched.error || 'background spawn failed')

@@ -12,6 +12,134 @@ export function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`
 }
 
+/**
+ * Convert a canonical REMOTE path — as the SFTP `realpath` reports it, which
+ * is POSIX-style even on Windows hosts (`/X:/work/demo`) — into the form a
+ * Windows shell accepts (`X:/work/demo`). PowerShell understands forward
+ * slashes, so only a leading `/X:` drive prefix is stripped; everything else
+ * passes through untouched.
+ */
+export function toWinPath(value) {
+  const s = String(value ?? '')
+  return /^\/[A-Za-z]:/.test(s) ? s.slice(1) : s
+}
+
+/** PowerShell single-quote escaping for a path/string literal. */
+export function psQuote(value) {
+  return `'${String(value).replace(/'/g, "''")}'`
+}
+
+/**
+ * Strip PowerShell progress records from a stderr capture. When a nested
+ * powershell is launched by a Windows OpenSSH exec channel (e.g. the cmd
+ * default-shell wrapper), the engine's first-run module-analysis warm-up emits
+ * a `#< CLIXML …</Objs>` progress blob to stderr on every fresh process —
+ * real cmdlet errors still arrive as plain text, so removing only CLIXML
+ * blocks keeps genuine diagnostics intact.
+ */
+export function stripPsProgressClixml(text) {
+  const lines = String(text ?? '').split('\n')
+  const out = []
+  let inBlob = false
+  for (const line of lines) {
+    if (!inBlob && /#< CLIXML/i.test(line)) {
+      inBlob = !/<\/Objs>/i.test(line)
+      continue
+    }
+    if (inBlob) {
+      if (/<\/Objs>/i.test(line)) { inBlob = false; continue }
+      // XML record lines are dropped; a non-XML text line ends a truncated
+      // blob so genuine diagnostics that follow it are preserved.
+      if (!/^\s*</.test(line) && line.trim() !== '') { inBlob = false; out.push(line); continue }
+      continue
+    }
+    out.push(line)
+  }
+  return out.join('\n')
+}
+
+/**
+ * Exit-code glue appended to every Windows remote script so the channel's
+ * exit status mirrors what a POSIX shell reports: the last command's result.
+ * `exit N` inside the user's own command terminates first and wins.
+ */
+const PS_EXIT_GLUE = 'if ($?) { exit $LASTEXITCODE } else { exit 1 }'
+
+/**
+ * Remote execution profiles, probed once per target and cached for the
+ * process lifetime:
+ *   { family: 'posix',  os: 'linux'|'darwin', shell: 'posix' }
+ *   { family: 'windows', os: 'windows', shell: 'powershell'|'cmd' }
+ *   { family: 'unknown', … } — callers fall back to POSIX behaviour.
+ */
+const REMOTE_PROFILE_CACHE = new Map()
+
+export function profileCacheKey({ host, user, port }) {
+  return `${user ?? ''}@${host ?? ''}:${port ?? 22}`
+}
+
+/**
+ * Detect a target's OS family and default exec shell without parsing
+ * localized output: `uname -s` proves a POSIX shell; `cmd /c ver` proves
+ * Windows (it runs from cmd, PowerShell and Git Bash defaults alike); a
+ * `$PSVersionTable` expression then tells cmd from PowerShell as the default.
+ */
+export async function probeRemoteProfile(client) {
+  const uname = await client.run('uname -s')
+  if (uname.ok) {
+    const os = (uname.stdout ?? '').trim().toLowerCase()
+    return { family: 'posix', os: os.startsWith('darwin') ? 'darwin' : 'linux', shell: 'posix' }
+  }
+  const ver = await client.run('cmd /c ver')
+  if (ver.ok && /windows/i.test(ver.stdout ?? '')) {
+    const ps = await client.run('$PSVersionTable.PSVersion.ToString()')
+    return ps.ok
+      ? { family: 'windows', os: 'windows', shell: 'powershell' }
+      : { family: 'windows', os: 'windows', shell: 'cmd' }
+  }
+  return { family: 'unknown', os: 'unknown', shell: 'unknown' }
+}
+
+/** Encode a PowerShell script for quote-safe transport through cmd.exe.
+ *
+ * `powershell -EncodedCommand` would be ideal (no quoting at all), but a
+ * nested -EncodedCommand host serializes BOTH progress and error records to
+ * stderr as CLIXML soup. A `-Command` host prints plain text, so instead the
+ * script rides inside one fixed, quote-free command line: base64 has no
+ * `% ! ^ " $ '` and the wrapper has no `$`, so neither cmd nor a PowerShell
+ * outer shell can mangle it, and the inner text is decoded + `iex`'d.
+ */
+export function psCommandEnvelope(script) {
+  const b64 = Buffer.from(script, 'utf16le').toString('base64')
+  return `powershell -NoProfile -NonInteractive -Command "& { iex ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${b64}'))) }"`
+}
+
+/**
+ * Build the exec-channel script for one command under a remote profile.
+ *
+ * POSIX / unknown: unchanged legacy form (`cd 'x' || exit 1` + command).
+ *
+ * Windows with a PowerShell default shell: the raw script text is executed
+ * by the server's default shell directly (cmdlets + aliases like ls/cat/cd
+ * make simple commands work), prefixed with a `Set-Location` when a cwd is
+ * given and suffixed with the exit-code glue. Windows with a cmd default
+ * shell: the same script rides inside a fixed, quote-free
+ * `powershell -Command` envelope (base64 + iex), so cmd only ever parses one
+ * fixed command line, its exit code is the child's, and stderr stays plain
+ * text (no CLIXML records).
+ */
+export function buildExecScript(profile, command, cwd) {
+  if (profile === undefined || profile.family !== 'windows') {
+    return cwd ? `cd ${shellQuote(cwd)} || exit 1\n${command}` : command
+  }
+  const script = [
+    ...(cwd ? [`Set-Location -LiteralPath ${psQuote(toWinPath(cwd))}`] : []),
+    command,
+    PS_EXIT_GLUE,
+  ].join('\n')
+  return profile.shell === 'cmd' ? psCommandEnvelope(script) : script
+}
+
 /** Bounded output collector: keeps the TAIL of a stream, flags truncation. */
 class CapCollector {
   constructor(maxBytes) {
@@ -193,9 +321,15 @@ export class SshClient {
    * bounded (tail-kept) stdout/stderr, stdin, and an abort signal that closes
    * the exec channel (SIGHUP on the remote). Resolves with exitCode/signal,
    * timedOut/aborted first-cause, and `{ text, truncated }` outputs.
+   *
+   * The command text is executed through the target's default shell. On
+   * Windows targets the script is built per detected default shell
+   * (`buildExecScript`): raw PowerShell when PowerShell is the default, a
+   * quote-safe `powershell -EncodedCommand` wrapper when cmd is.
    */
   async execShell(command, { cwd, timeoutMs = 60000, stdoutMaxBytes = 64000, stderrMaxBytes = 64000, stdin, signal } = {}) {
-    const script = cwd ? `cd ${shellQuote(cwd)} || exit 1\n${command}` : command
+    const profile = await this.profile()
+    const script = buildExecScript(profile, command, cwd)
     return await new Promise((resolve) => {
       const conn = new Client()
       let settled = false
@@ -228,14 +362,17 @@ export class SshClient {
           s.stderr.on('data', (d) => errc.push(d))
           s.on('close', (code) => {
             const aborted = signal !== undefined && signal.aborted
+            const stdout = out.output()
+            const stderr = errc.output()
+            if (profile.family === 'windows') stderr.text = stripPsProgressClixml(stderr.text)
             finish({
               ok: true,
               exitCode: code,
               signal: null,
               timedOut: timedOut && !aborted,
               aborted: aborted && !timedOut,
-              stdout: out.output(),
-              stderr: errc.output(),
+              stdout,
+              stderr,
             })
           })
           if (stdin === undefined) s.end()
@@ -293,10 +430,29 @@ export class SshClient {
     })
   }
 
+  /**
+   * Cached remote execution profile ({ family, os, shell }); probed once per
+   * target and reused for the process lifetime.
+   */
+  async profile() {
+    const key = profileCacheKey(this)
+    let profile = REMOTE_PROFILE_CACHE.get(key)
+    if (profile === undefined) {
+      profile = await probeRemoteProfile(this)
+      REMOTE_PROFILE_CACHE.set(key, profile)
+    }
+    return profile
+  }
+
   async remoteOs() {
     if (this._os === undefined) {
-      const res = await this.run('uname -s')
-      this._os = (res.stdout ?? '').trim().toLowerCase().startsWith('darwin') ? 'darwin' : 'linux'
+      const profile = await this.profile()
+      if (profile.family === 'posix') this._os = profile.os === 'darwin' ? 'darwin' : 'linux'
+      else if (profile.family === 'windows') this._os = 'windows'
+      else {
+        const res = await this.run('uname -s')
+        this._os = (res.stdout ?? '').trim().toLowerCase().startsWith('darwin') ? 'darwin' : 'linux'
+      }
     }
     return this._os
   }
@@ -383,12 +539,25 @@ export class SshClient {
   }
 
   /**
-   * Remote file content hash for post-write verification. Tries GNU
-   * `sha256sum` then BSD `shasum -a 256`; returns the lowercase hex digest or
+   * Remote file content hash for post-write verification. On POSIX targets
+   * tries GNU `sha256sum` then BSD `shasum -a 256`; on Windows targets uses
+   * PowerShell `Get-FileHash`. Returns the lowercase hex digest or
    * `undefined` when no such tool exists (verification is then skipped).
    * Locale-independent: the digest is hex, never localized text.
    */
   async sha256(path) {
+    const profile = await this.profile()
+    if (profile.family === 'windows') {
+      const res = await this.execShell(
+        `(Get-FileHash -LiteralPath ${psQuote(toWinPath(path))} -Algorithm SHA256).Hash.ToLower()`,
+        { timeoutMs: 30000 },
+      )
+      if (res.exitCode === 0) {
+        const hash = (res.stdout?.text ?? '').trim().toLowerCase()
+        if (/^[0-9a-f]{64}$/.test(hash)) return hash
+      }
+      return undefined
+    }
     for (const cmd of [`sha256sum ${shellQuote(path)}`, `shasum -a 256 ${shellQuote(path)}`]) {
       const res = await this.run(`${cmd} 2>/dev/null`)
       if (res.ok) {

@@ -93,6 +93,13 @@ function messageOf(error) {
   return error instanceof Error ? error.message : String(error)
 }
 
+/** Directory flag from an SFTP attrs record (protocol-level, locale-free). */
+function attrsIsDir(st) {
+  if (st && typeof st.isDirectory === 'function') return st.isDirectory()
+  if (st && typeof st.mode === 'number') return (st.mode & 0o170000) === 0o040000
+  return false
+}
+
 /**
  * Build an `SshClient` for a remote host, preferring a saved machine's
  * credentials (password/identityFile/passphrase) and falling back to
@@ -107,28 +114,34 @@ function clientForRemote(host, user, port) {
 /**
  * Resolve a raw browse path (home, `~`, `~/x`, relative, or absolute) to an
  * absolute remote path so the client can navigate "up" past home to `/` and
- * display a real path.
+ * display a real path. Accepts an optional open SFTP facade to reuse across
+ * resolve + listing; otherwise opens its own channel. Resolution goes over
+ * SFTP (`realpath`), so it works identically on POSIX and Windows targets and
+ * never parses localized shell output.
  */
-async function resolveRemotePath(client, raw) {
+async function resolveRemotePath(client, raw, sharedSftp) {
   const trimmed = raw === undefined || raw === null ? '' : String(raw).trim()
-  let sftp
+  let owned
+  const sftp = async () => {
+    if (sharedSftp !== undefined) return sharedSftp
+    owned = owned ?? await client.sftp()
+    return owned
+  }
   try {
     if (trimmed === '' || trimmed === '~' || trimmed === '~/') {
-      sftp = await client.sftp()
-      return await sftp.realpath('.')
+      return await (await sftp()).realpath('.')
     }
     if (trimmed.startsWith('~/')) {
-      sftp = await client.sftp()
-      const home = String(await sftp.realpath('.')).replace(/\/+$/, '')
+      const s = await sftp()
+      const home = String(await s.realpath('.')).replace(/\/+$/, '')
       return `${home}/${trimmed.slice(2)}`
     }
     if (!trimmed.startsWith('/')) {
-      sftp = await client.sftp()
-      return await sftp.realpath(trimmed)
+      return await (await sftp()).realpath(trimmed)
     }
     return trimmed
   } finally {
-    if (sftp) sftp.end()
+    if (owned !== undefined) owned.end()
   }
 }
 
@@ -183,22 +196,35 @@ function remoteWorkspacesService() {
     },
 
     async listRemoteDir(machine, path) {
-      // `-A` hides `.`/`..`, `-p` appends `/` to directories, `-1` one per line.
+      // Pure-SFTP listing (readdir + attrs) — the SAME channel the fs backend
+      // uses, so Windows targets work: no `ls`, no localized output parsing,
+      // no dependency on the remote's default shell.
       const client = sshClientFor(machine)
-      let absPath
+      let sftp
       try {
-        absPath = await resolveRemotePath(client, path)
+        sftp = await client.sftp()
+      } catch (error) {
+        return { ok: false, error: `无法建立 SFTP 连接：${messageOf(error)}` }
+      }
+      try {
+        const absPath = await resolveRemotePath(client, path, sftp)
+        let list
+        try {
+          list = await sftp.readdir(absPath)
+        } catch (error) {
+          const missing = error && (error.code === 2 || /no such file|not exist|找不到/i.test(String(error.message)))
+          return { ok: false, error: missing ? `目录不存在：${absPath}` : `无法读取目录：${messageOf(error)}` }
+        }
+        const entries = (Array.isArray(list) ? list : [])
+          .filter((e) => e && e.filename !== '.' && e.filename !== '..')
+          .map((e) => ({ name: e.filename, dir: attrsIsDir(e.attrs) }))
+          .sort((a, b) => a.name.localeCompare(b.name))
+        return { ok: true, entries, path: absPath }
       } catch (error) {
         return { ok: false, error: `无法解析目录：${messageOf(error)}` }
+      } finally {
+        sftp.end()
       }
-      const command = absPath === '' ? 'ls -1Ap' : `ls -1Ap ${shellQuote(absPath)}`
-      const res = await client.run(command)
-      if (!res.ok) return { ok: false, error: (res.stderr ?? '').trim() || res.error || '列出目录失败' }
-      const entries = res.stdout
-        .split('\n')
-        .filter((name) => name !== '')
-        .map((name) => ({ name: name.replace(/\/$/, ''), dir: name.endsWith('/') }))
-      return { ok: true, entries, path: absPath }
     },
 
     /**
