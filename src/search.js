@@ -11,7 +11,7 @@
  */
 
 import { posix } from 'node:path'
-import { shellQuote } from './transport.js'
+import { shellQuote, psQuote, toWinPath, profileCacheKey } from './transport.js'
 import { findByCwd } from './registry.js'
 
 const GREP_MAX_MATCHES = 250
@@ -20,6 +20,9 @@ const RAW_OUTPUT_MAX_BYTES = 20 * 1024 * 1024
 const SEARCH_TIMEOUT_MS = 30_000
 const STDERR_MAX_BYTES = 64 * 1024
 const GRACE_MS = 3_000
+
+/** One-time rg-presence verdict per Windows target (process lifetime). */
+const RG_PRESENCE_CACHE = new Map()
 
 // ---------------------------------------------------------------------------
 // ripgrep argv (mirrors @deepseek-ai/dsh-tool-fs-search)
@@ -108,18 +111,57 @@ async function localRg(deps, argv, cwd, signal) {
   if (outcome.exitCode !== 0 && outcome.exitCode !== 1) {
     throw new Error(`grep/glob: rg failed (exit ${outcome.exitCode}): ${stderr?.text ?? ''}`)
   }
-  return stdout?.text ?? ''
+  return { stdout: stdout?.text ?? '', windows: false }
+}
+
+/**
+ * Build the remote `rg` command line for one profile. POSIX keeps the legacy
+ * single-quoted form. Windows runs rg.exe inside the per-shell PowerShell
+ * script, so EVERY token is PowerShell-single-quoted (patterns with spaces or
+ * apostrophes stay one argument) and the search root — the token after `--`,
+ * which arrives in the canonical `/X:/…` SFTP form — is converted with
+ * `toWinPath` because native rg.exe does not understand a leading-slash drive
+ * path. `--path-separator=/` forces forward-slash paths in rg's JSON/file
+ * output, matching every other path the plugin surfaces (native rg.exe would
+ * otherwise print `src\file.js`). `--regexp`/`--glob` values are pattern text
+ * and pass through as-is.
+ */
+export function remoteRgCommand(profile, argv) {
+  if (profile !== undefined && profile.family === 'windows') {
+    const parts = [psQuote('--path-separator=/')]
+    let isRoot = false
+    for (const token of argv) {
+      parts.push(isRoot ? psQuote(toWinPath(token)) : psQuote(token))
+      isRoot = token === '--'
+    }
+    return `rg ${parts.join(' ')}`
+  }
+  return ['rg', ...argv].map(shellQuote).join(' ')
+}
+
+/**
+ * Verify ripgrep exists on a Windows target once per process. A missing `rg`
+ * must NOT surface as the glue's exit 1 (which the caller reads as "no
+ * matches"), so it is detected up front and reported with an install hint.
+ */
+async function ensureRemoteRg(client) {
+  const key = profileCacheKey(client)
+  let present = RG_PRESENCE_CACHE.get(key)
+  if (present === undefined) {
+    const probe = await client.run('rg --version')
+    present = probe.ok
+    RG_PRESENCE_CACHE.set(key, present)
+  }
+  if (!present) {
+    throw new Error('grep/glob: ripgrep was not found on the remote Windows host. Install it first (e.g. winget install BurntSushi.ripgrep.MSVC or scoop install ripgrep) and retry')
+  }
 }
 
 async function remoteRg(client, argv, remoteCwd, signal) {
-  // ripgrep is a POSIX-world tool: Windows remotes have no `rg` in their
-  // default PATH (and cmd/PowerShell cannot run it). Report an explicit,
-  // actionable error instead of a confusing command-not-found exit.
   const profile = await client.profile()
-  if (profile.family === 'windows') {
-    throw new Error('grep/glob: Windows 远程主机暂不支持 rg 搜索（远端未安装 ripgrep）')
-  }
-  const command = ['rg', ...argv].map(shellQuote).join(' ')
+  const windows = profile.family === 'windows'
+  if (windows) await ensureRemoteRg(client)
+  const command = remoteRgCommand(profile, argv)
   const result = await client.execShell(command, {
     cwd: remoteCwd,
     timeoutMs: SEARCH_TIMEOUT_MS,
@@ -131,7 +173,16 @@ async function remoteRg(client, argv, remoteCwd, signal) {
   if (result.exitCode !== 0 && result.exitCode !== 1) {
     throw new Error(`grep/glob: remote rg failed (exit ${result.exitCode}): ${result.stderr.text}`)
   }
-  return result.stdout.text
+  return { stdout: result.stdout.text, windows }
+}
+
+/**
+ * rg.exe ignores `--path-separator` for the JSON match records it emits, so
+ * grep paths come back with native backslashes on Windows remotes. Normalize
+ * to forward slashes so every surfaced path matches the canonical form.
+ */
+function normalizeWindowsPath(value) {
+  return String(value).replace(/\\/g, '/')
 }
 
 // ---------------------------------------------------------------------------
@@ -223,8 +274,13 @@ export function createSearchTools(deps) {
         ...(args.path !== undefined ? { path: args.path } : {}),
         ...(args.include !== undefined ? { include: args.include } : {}),
       }
-      const stdout = await runRg(exec, grepArgv, input)
-      return { matches: parseGrepMatches(stdout).slice(0, GREP_MAX_MATCHES) }
+      const { stdout, windows } = await runRg(exec, grepArgv, input)
+      const matches = parseGrepMatches(stdout).slice(0, GREP_MAX_MATCHES)
+      return {
+        matches: windows
+          ? matches.map((m) => ({ ...m, path: normalizeWindowsPath(m.path) }))
+          : matches,
+      }
     },
   }
 
@@ -255,8 +311,9 @@ export function createSearchTools(deps) {
     },
     async execute(args, exec) {
       const input = { pattern: args.pattern, ...(args.path !== undefined ? { path: args.path } : {}) }
-      const stdout = await runRg(exec, globArgv, input)
-      return { paths: parseGlobPaths(stdout).slice(0, GLOB_MAX_RESULTS) }
+      const { stdout, windows } = await runRg(exec, globArgv, input)
+      const paths = parseGlobPaths(stdout).slice(0, GLOB_MAX_RESULTS)
+      return { paths: windows ? paths.map(normalizeWindowsPath) : paths }
     },
   }
 

@@ -6,6 +6,7 @@
  * All paths are neutral fixtures (never a real host's drive layout).
  */
 import { toWinPath, psQuote, psCommandEnvelope, buildExecScript, stripPsProgressClixml, shellQuote } from '../src/transport.js'
+import { remoteRgCommand } from '../src/search.js'
 
 const results = []
 function check(label, cond, detail = '') {
@@ -76,6 +77,21 @@ check('psQuote escapes apostrophe', psQuote("it's") === `'it''s'`)
   const partial = stripPsProgressClixml('#< CLIXML\r\n<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">\r\n' + plain)
   check('strips unterminated partial CLIXML tail', partial === plain, JSON.stringify(partial))
   check('leaves non-CLIXML text untouched', stripPsProgressClixml(plain) === plain)
+}
+
+// --- remoteRgCommand --------------------------------------------------------
+{
+  const POSIX = { family: 'posix', os: 'linux', shell: 'posix' }
+  const posixCmd = remoteRgCommand(POSIX, ['--json', '--regexp=x', '--glob=*.ts', '--', '/data/x'])
+  check('rg command posix keeps shellQuote form', posixCmd === `'rg' '--json' '--regexp=x' '--glob=*.ts' '--' '/data/x'`, posixCmd)
+
+  const WIN = { family: 'windows', os: 'windows', shell: 'powershell' }
+  const winCmd = remoteRgCommand(WIN, ['--json', '--regexp=foo bar', '--glob=*.ts', '--', '/X:/work/demo'])
+  check('rg command windows quotes every token + path separator', winCmd === `rg '--path-separator=/' '--json' '--regexp=foo bar' '--glob=*.ts' '--' 'X:/work/demo'`, winCmd)
+  check('rg command windows strips drive prefix on the root', winCmd.includes(`'--' 'X:/work/demo'`), winCmd)
+  check('rg command windows root "." stays "."', remoteRgCommand(WIN, ['--files', '--', '.']).endsWith(`'--' '.'`))
+  const apostrophe = remoteRgCommand(WIN, ['--json', "--regexp=it's", '--', '/X:/w'])
+  check('rg command windows escapes apostrophes', apostrophe.includes(`'--regexp=it''s'`), apostrophe)
 }
 
 // shellQuote still sane (regression guard)
