@@ -226,6 +226,7 @@ export class SshShellExecutor {
     let buffer = ''
     let spawnError
     let pollTimer
+    let streamCtl = null
 
     const proc = {
       status: 'running',
@@ -240,17 +241,48 @@ export class SshShellExecutor {
       kill() {
         if (proc.status !== 'running') return false
         proc.status = 'killed'
-        if (pid !== null) void client.run(`kill ${pid} 2>/dev/null || true`)
+        if (streamCtl !== null) streamCtl.terminate()
+        else if (pid !== null) void client.run(`kill ${pid} 2>/dev/null || true`)
         return true
       },
       done: (async () => {
-        // Background jobs need POSIX nohup/tail/kill plumbing; on Windows
-        // remotes there is no POSIX shell to run it in. Fail explicitly
-        // instead of emitting a confusing spawn error from cmd/PowerShell.
         const profile = await client.profile()
         if (profile.family === 'windows') {
-          spawnError = new Error('remote background start is not supported on Windows hosts yet')
-          proc.status = 'killed'
+          // No nohup-style detach exists on Windows remotes, and closing the
+          // channel alone does NOT reap the remote tree (verified) - so the
+          // job is a long-lived exec stream whose terminate() actively
+          // taskkill /T's the remote PID and then closes the channel.
+          const ctl = await client.execStream(spec.command, { cwd: path })
+          if (proc.status !== 'running') { ctl.terminate(); return }
+          streamCtl = ctl
+          const merge = () => {
+            const outPart = ctl.readOut()
+            const errPart = ctl.readErr()
+            if (outPart.delta.length > 0) {
+              if (buffer.length > 0 && !buffer.endsWith('\n')) buffer += '\n'
+              buffer += outPart.delta
+            }
+            if (errPart.delta.length > 0) {
+              if (buffer.length > 0 && !buffer.endsWith('\n')) buffer += '\n'
+              buffer += '[stderr]\n' + errPart.delta
+            }
+          }
+          if (spec.signal !== undefined) {
+            const onAbort = () => { if (streamCtl !== null) streamCtl.terminate() }
+            if (spec.signal.aborted) onAbort()
+            else spec.signal.addEventListener('abort', onAbort, { once: true })
+          }
+          const pump = async () => {
+            while (proc.status === 'running') {
+              merge()
+              await new Promise((r) => setTimeout(r, 150))
+            }
+          }
+          void pump()
+          const outcome = await ctl.exit
+          merge()
+          if (proc.status === 'running') proc.status = 'completed'
+          proc.exitCode = typeof outcome.exitCode === 'number' ? outcome.exitCode : null
           return
         }
         const launched = await client.run(launchScript)

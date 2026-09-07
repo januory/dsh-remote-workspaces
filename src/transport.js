@@ -431,6 +431,128 @@ export class SshClient {
   }
 
   /**
+   * Open a LONG-LIVED exec channel for streaming (used by background/start
+   * jobs on Windows remotes, where no nohup-style detach exists and closing
+   * the channel alone does NOT reliably reap the remote command tree — a kill
+   * must actively `taskkill /T` the remote process first; the channel close
+   * is only a fallback).
+   *
+   * On Windows the remote script is prefixed with a self-reporting PID line
+   * (`DWSH_PID=<pid>`), which is parsed out of the first output chunk so the
+   * controller can tree-kill the exact process. Resolves a controller:
+   *   { readOut(), readErr() -> { delta, lossy }, exit: Promise<{exitCode}|{error}>, terminate() }
+   */
+  async execStream(command, { cwd, signal, stdoutMaxBytes = 16 * 1024 * 1024, stderrMaxBytes = 16 * 1024 * 1024 } = {}) {
+    const profile = await this.profile()
+    const windows = profile.family === 'windows'
+    const ssh = this
+    // The marker runs FIRST inside the same remote shell that owns the exec
+    // channel (the raw PowerShell on PS-default hosts, the nested PowerShell
+    // inside the -Command envelope on cmd-default hosts), so its $PID is the
+    // process whose tree taskkill must reap.
+    const markerCommand = windows ? "Write-Output ('DWSH_PID=' + $PID)\n" + command : command
+    const script = buildExecScript(profile, markerCommand, cwd)
+    return await new Promise((resolve, reject) => {
+      const conn = new Client()
+      const out = { buf: '', pos: 0, max: stdoutMaxBytes, lossy: false }
+      const err = { buf: '', pos: 0, max: stderrMaxBytes, lossy: false }
+      let stream
+      let settled = false
+      let pidResolve
+      const pid = new Promise((res) => { pidResolve = res })
+      // A stuck launch must not hold terminate() forever.
+      const pidTimer = setTimeout(() => pidResolve(null), 8000)
+      let exitResolve
+      const exit = new Promise((res) => { exitResolve = res })
+      const finish = (value) => {
+        if (settled) return
+        settled = true
+        clearTimeout(pidTimer)
+        try { conn.end() } catch {}
+        exitResolve(value)
+      }
+      const push = (target) => (chunk) => {
+        const piece = String(chunk)
+        if (target.buf.length + piece.length > target.max) { target.lossy = true; return }
+        target.buf += piece
+      }
+      const reader = (target) => () => {
+        const delta = target.buf.slice(target.pos)
+        target.pos = target.buf.length
+        return { delta, lossy: target.lossy }
+      }
+      // The PID marker is the FIRST stdout line, but the first data chunk may
+      // hold only part of it, so buffer head bytes until the line completes.
+      let head = ''
+      let markerResolved = false
+      const onOut = (chunk) => {
+        if (markerResolved) { push(out)(chunk); return }
+        head += String(chunk)
+        if (windows) {
+          const m = /^DWSH_PID=(\d+)\r?\n/.exec(head)
+          if (m !== null) {
+            markerResolved = true
+            clearTimeout(pidTimer)
+            pidResolve(Number(m[1]))
+            const rest = head.slice(m[0].length)
+            head = ''
+            if (rest.length > 0) push(out)(rest)
+            return
+          }
+          if (head.length > 4096) {
+            // Something else produced output first; give up on the marker.
+            markerResolved = true
+            clearTimeout(pidTimer)
+            pidResolve(null)
+            push(out)(head)
+            head = ''
+          }
+          return
+        }
+        markerResolved = true
+        clearTimeout(pidTimer)
+        pidResolve(null)
+        push(out)(head)
+        head = ''
+      }
+      conn.on('ready', () => {
+        conn.exec(script, (execError, s) => {
+          if (execError) { finish({ error: execError.message }); return }
+          stream = s
+          s.on('data', onOut)
+          s.stderr.on('data', push(err))
+          s.on('close', (code) => { finish({ exitCode: code }) })
+          s.end()
+        })
+      })
+      conn.on('error', (connError) => finish({ error: connError.message }))
+      try { conn.connect(this.connectConfig()) } catch (connectError) { finish({ error: connectError.message }) }
+      resolve({
+        readOut: reader(out),
+        readErr: reader(err),
+        exit,
+        terminate() {
+          const doClose = () => {
+            try { if (stream) stream.close() } catch {}
+            try { conn.end() } catch {}
+            // Settle explicitly: the remote 'close' event is not guaranteed.
+            finish({ exitCode: null })
+          }
+          pid.then((remotePid) => {
+            if (typeof remotePid === 'number' && remotePid > 0) {
+              void ssh.execShell(`taskkill /PID ${remotePid} /T /F`, {
+                timeoutMs: 15000, stdoutMaxBytes: 4096, stderrMaxBytes: 4096,
+              }).catch(() => {}).finally(doClose)
+            } else {
+              doClose()
+            }
+          })
+        },
+      })
+    })
+  }
+
+  /**
    * Cached remote execution profile ({ family, os, shell }); probed once per
    * target and reused for the process lifetime.
    */
