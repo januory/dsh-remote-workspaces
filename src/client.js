@@ -67,8 +67,11 @@ var INVOCATIONS = [
   invocation('listRemoteDir', [jsonParameter('machine'), jsonParameter('path')]),
   invocation('openRemoteWorkspace', [jsonParameter('machine'), jsonParameter('path')]),
   invocation('openShellLocal', [jsonParameter('opts')]),
+  invocation('openShellRemote', [jsonParameter('machine'), jsonParameter('opts')]),
+  invocation('openShellAt', [jsonParameter('cwd'), jsonParameter('opts')]),
   invocation('shellWrite', [jsonParameter('id'), jsonParameter('data')]),
   invocation('shellRead', [jsonParameter('id')]),
+  invocation('shellResize', [jsonParameter('id'), jsonParameter('rows'), jsonParameter('cols')]),
   invocation('shellClose', [jsonParameter('id')]),
   invocation('shellList'),
 ]
@@ -804,13 +807,36 @@ function unwrapRemote(res) {
     }
 
     // =========================================================================
-    // Shell tab: a real xterm terminal driving a local (S0) PTY session.
+    // Shell tab: a real xterm terminal opened directly AT the current workspace
+    // cwd — no local/remote chooser. The host resolves the cwd to a local PTY
+    // or to a remote shell channel on the matching anchor machine.
+    //
+    // A shell session is KEPT ALIVE across session switches: the tab body
+    // unmounts when its session leaves the screen but its occurrence signal is
+    // NOT aborted, so the host session persists and the next mount re-attaches
+    // to it (no reconnect, no "连接中").
     // =========================================================================
+    var shellSessionCache = {}
+    var shellKeySeq = 0
+    var shellKeyBySignal = typeof WeakMap !== 'undefined' ? new WeakMap() : null
+
     function ShellBody(props) {
       var getRemote = props.getRemote
+      var getCwd = props.getCwd
+      var useTabInfo = props.useTabInfo
+      return React.createElement(TerminalPane, { getRemote: getRemote, getCwd: getCwd, useTabInfo: useTabInfo })
+    }
+
+    function TerminalPane(props) {
+      var getRemote = props.getRemote
+      var getCwd = props.getCwd
+      var useTabInfo = props.useTabInfo
+      var info = useTabInfo ? useTabInfo() : null
+      var tabSignal = info ? info.tab.signal : null
       var containerRef = React.useRef(null)
       var termRef = React.useRef(null)
       var sessionRef = React.useRef(null)
+      var kindRef = React.useRef(null)
       var timerRef = React.useRef(null)
       var statusState = React.useState('connecting')
       var status = statusState[0]
@@ -818,6 +844,9 @@ function unwrapRemote(res) {
       var errState = React.useState(null)
       var err = errState[0]
       var setErr = errState[1]
+      var labelState = React.useState('终端')
+      var label = labelState[0]
+      var setLabel = labelState[1]
 
       React.useEffect(function () {
         var disposed = false
@@ -862,19 +891,40 @@ function unwrapRemote(res) {
           return undefined
         }
 
-        term.writeln('\x1b[36m[shell] 正在打开本机终端…\x1b[0m')
+        // Stable per-(session, tab) key, derived once from the occurrence's
+        // abort signal (stable across session switches). A re-mount re-attaches
+        // to the same host session instead of reconnecting.
+        var key
+        if (shellKeyBySignal && tabSignal) {
+          key = shellKeyBySignal.get(tabSignal)
+          if (key === undefined) {
+            key = 'shell-' + (++shellKeySeq) + '-' + Math.random().toString(36).slice(2)
+            shellKeyBySignal.set(tabSignal, key)
+          }
+        } else {
+          key = 'shell-' + (++shellKeySeq) + '-' + Math.random().toString(36).slice(2)
+        }
 
         var opened = false
         var ro = null
         var rafId = 0
+        var resizePending = false
 
         function openWithFittedSize() {
           if (disposed || opened) return
           opened = true
-          if (ro !== null) { ro.disconnect(); ro = null }
           if (rafId) { cancelAnimationFrame(rafId); rafId = 0 }
           try { fitAddon.fit() } catch (e) { /* keep default rows/cols */ }
-          ns.openShellLocal({ rows: term.rows, cols: term.cols }).then(
+          var cached = shellSessionCache[key]
+          if (cached && cached.id) {
+            // Re-attaching to a kept-alive session: show connected at once,
+            // and the full scrollback replays when the attach resolves below.
+            setLabel(cached.label || '本机')
+            setStatus('open')
+          }
+          var opts = { rows: term.rows, cols: term.cols, key: key }
+          var cwd = getCwd ? getCwd() : undefined
+          ns.openShellAt(cwd, opts).then(
             function (res) {
               if (disposed) return
               var b = unwrapRemote(res)
@@ -884,25 +934,13 @@ function unwrapRemote(res) {
                 term.writeln('\x1b[31m[shell] ' + (b.error || '打开失败') + '\x1b[0m')
                 return
               }
+              // Attach replays the capped scrollback so the terminal is not blank.
+              if (b.attached && b.history) term.write(b.history)
               sessionRef.current = b.id
+              kindRef.current = b.kind || null
+              setLabel(b.label || (b.kind === 'remote' ? '远程' : '本机'))
               setStatus('open')
-              function tick() {
-                if (disposed) return
-                var id = sessionRef.current
-                if (!id) return
-                ns.shellRead(id).then(
-                  function (r) {
-                    if (disposed) return
-                    var out = unwrapRemote(r)
-                    if (out.ok && out.text) term.write(out.text)
-                    timerRef.current = setTimeout(tick, 60)
-                  },
-                  function () {
-                    if (disposed) return
-                    timerRef.current = setTimeout(tick, 60)
-                  },
-                )
-              }
+              shellSessionCache[key] = { id: b.id, kind: b.kind || null, label: b.label || (b.kind === 'remote' ? '远程' : '本机') }
               timerRef.current = setTimeout(tick, 60)
             },
             function (e) {
@@ -914,13 +952,67 @@ function unwrapRemote(res) {
           )
         }
 
-        // Wait for the flex chain to give the container real dimensions, then
-        // fit once and open the PTY at the fitted rows/cols so the terminal
-        // content actually fills the pane (not just the viewport background).
+        function tick() {
+          if (disposed) return
+          var id = sessionRef.current
+          if (!id) return
+          ns.shellRead(id).then(
+            function (r) {
+              if (disposed) return
+              var out = unwrapRemote(r)
+              if (out.ok) {
+                if (out.text) term.write(out.text)
+                if (out.eof) { endSession('会话已结束'); return }
+              } else if (/session not found/.test(out.error || '')) {
+                endSession('会话已结束')
+                return
+              }
+              timerRef.current = setTimeout(tick, 60)
+            },
+            function () {
+              if (disposed) return
+              timerRef.current = setTimeout(tick, 60)
+            },
+          )
+        }
+
+        function endSession(msg) {
+          if (disposed || sessionRef.current === null) return
+          var id = sessionRef.current
+          sessionRef.current = null
+          if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null }
+          term.writeln('\r\n\x1b[2m[shell] ' + msg + '\x1b[0m')
+          setStatus('ended')
+          delete shellSessionCache[key]
+          if (id) ns.shellClose(id)
+        }
+
+        function scheduleFit() {
+          if (disposed || !opened || sessionRef.current === null) return
+          if (resizePending) return
+          resizePending = true
+          requestAnimationFrame(function () {
+            resizePending = false
+            if (disposed || !opened || sessionRef.current === null) return
+            var beforeR = term.rows
+            var beforeC = term.cols
+            try { fitAddon.fit() } catch (e) { /* noop */ }
+            if (term.rows !== beforeR || term.cols !== beforeC) {
+              var id = sessionRef.current
+              if (kindRef.current === 'remote') ns.shellResize(id, term.rows, term.cols)
+            }
+          })
+        }
+
+        // Fit once when the flex chain gives real dimensions, then re-fit live
+        // on resize. Remote sessions push the new rows/cols to the PTY via
+        // setWindow; local sessions only re-fit the view (no seam resize — S0).
         if (typeof ResizeObserver !== 'undefined') {
           ro = new ResizeObserver(function (entries) {
             var r = entries[0] && entries[0].contentRect
-            if (r && r.height > 0 && r.width > 0) openWithFittedSize()
+            if (!r || r.height <= 0 || r.width <= 0) return
+            if (opened) scheduleFit()
+            else openWithFittedSize()
           })
           ro.observe(el)
         }
@@ -944,7 +1036,14 @@ function unwrapRemote(res) {
           if (timerRef.current) clearTimeout(timerRef.current)
           if (dataDisposable && dataDisposable.dispose) dataDisposable.dispose()
           var id = sessionRef.current
-          if (id && ns) ns.shellClose(id)
+          // Close the host session only when the tab is genuinely removed
+          // (occurrence signal aborted). A session switch unmounts the body
+          // WITHOUT aborting, so the shell stays alive for the next re-attach.
+          var removed = tabSignal ? tabSignal.aborted : true
+          if (id && ns && removed) {
+            delete shellSessionCache[key]
+            ns.shellClose(id)
+          }
           if (termRef.current) { try { termRef.current.dispose() } catch (e2) { /* noop */ } }
           termRef.current = null
           sessionRef.current = null
@@ -954,6 +1053,10 @@ function unwrapRemote(res) {
       return React.createElement(
         'div',
         { className: 'dsh-rw-shell', style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, overflow: 'hidden' } },
+        React.createElement('div', { style: { flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: 8, padding: '4px 10px', borderBottom: '1px solid ' + borderColor, fontSize: 12, color: '#8b8f98' } },
+          React.createElement('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+            status === 'open' ? label + ' · 已连接' : status === 'ended' ? label + ' · 已结束' : status === 'error' ? label + ' · 出错' : '连接中…'),
+        ),
         err !== null
           ? React.createElement('div', { style: { flex: '0 0 auto', padding: '6px 10px', color: '#e5484d', fontFamily: 'ui-monospace, monospace', fontSize: 12, whiteSpace: 'pre-wrap' } }, err)
           : null,
@@ -1004,7 +1107,7 @@ function unwrapRemote(res) {
       return fallback
     }
 
-    exports.inject = ['slots', 'remote', 'uiWorkspace', 'sidebarRightTabs']
+    exports.inject = ['slots', 'remote', 'uiWorkspace', 'sidebarRightTabs', 'sessions']
 
     exports.apply = function apply(ctx) {
       // Inject a small set of theme-aware control styles (hover / focus /
@@ -1042,6 +1145,16 @@ function unwrapRemote(res) {
 
       var mount = ctx.remote.$mount({ package: PACKAGE, descriptors: INVOCATIONS })
       var getRemote = function () { return ctx.get('remote.' + NAMESPACE) }
+      var getCwd = function () {
+        try {
+          var sessions = ctx.sessions
+          if (!sessions || !sessions.list || typeof sessions.list.getSnapshot !== 'function') return undefined
+          var snap = sessions.list.getSnapshot()
+          var id = snap && snap.current
+          var row = id && snap.byId ? snap.byId[id] : undefined
+          return row ? row.cwd : undefined
+        } catch (e) { return undefined }
+      }
 
       // Settings section: machines + open remote workspaces (grouped by host).
       ctx.slots.inject('settings.section', function () {
@@ -1068,14 +1181,14 @@ function unwrapRemote(res) {
           guide: [{
             order: 20,
             title: function () { return 'Shell' },
-            description: function () { return '打开本机或远程主机的交互终端' },
+            description: function () { return '打开当前工作区的交互终端' },
             icon: ShellIcon,
           }],
         })
       })
       ctx.slots.inject('sidebar.right.pane.tab', function () {
         return ctx.slots.register(
-          { name: 'sidebar.right.pane.tab', key: SHELL_ID, inject: function () { return { getRemote: getRemote } } },
+          { name: 'sidebar.right.pane.tab', key: SHELL_ID, inject: function () { return { getRemote: getRemote, getCwd: getCwd } } },
           ShellBody,
         )
       })

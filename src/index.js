@@ -71,8 +71,11 @@ const INVOCATIONS = [
   invocation('listRemoteDir', [jsonParameter('machine'), jsonParameter('path')]),
   invocation('openRemoteWorkspace', [jsonParameter('machine'), jsonParameter('path')]),
   invocation('openShellLocal', [jsonParameter('opts')]),
+  invocation('openShellRemote', [jsonParameter('machine'), jsonParameter('opts')]),
+  invocation('openShellAt', [jsonParameter('cwd'), jsonParameter('opts')]),
   invocation('shellWrite', [jsonParameter('id'), jsonParameter('data')]),
   invocation('shellRead', [jsonParameter('id')]),
+  invocation('shellResize', [jsonParameter('id'), jsonParameter('rows'), jsonParameter('cols')]),
   invocation('shellClose', [jsonParameter('id')]),
   invocation('shellList'),
 ]
@@ -190,7 +193,10 @@ async function resolveRemotePath(client, raw, sharedSftp) {
  * only lossless-JSON data and never echoes stored secrets back to the browser.
  */
 function remoteWorkspacesService(remote) {
-  const shells = createShellSessions(() => remote.getSubprocess())
+  const shells = createShellSessions({
+    getSubprocess: () => remote.getSubprocess(),
+    openRemote: (machine, opts) => sshClientFor(machine).openShell(opts),
+  })
   return {
     listMachines() {
       return { ok: true, machines: loadMachines().map(sanitizeMachine) }
@@ -314,11 +320,51 @@ function remoteWorkspacesService(remote) {
       }
     },
 
-    // Shell tool (S0: interactive local shell over ctx.subprocess.spawnTerminal).
+    // Shell tool: interactive local shell (ctx.subprocess.spawnTerminal) and
+    // remote shell (ssh2 conn.shell + pty). No approval (D6/D7): opening a
+    // shell is a user GUI action, equivalent to xshell — a separate line from
+    // the agent-side sandboxPolicy/approval gate. Credentials never ride the
+    // wire: the client sends only the sanitized machine (no secrets) and the
+    // host recovers password/passphrase from the store by id.
     async openShellLocal(opts) {
       try {
         const session = await shells.openLocal(opts ?? {})
         return { ok: true, ...session }
+      } catch (error) {
+        return { ok: false, error: messageOf(error) }
+      }
+    },
+
+    async openShellRemote(machine, opts) {
+      try {
+        const session = await shells.openRemote(machine ?? {}, opts ?? {})
+        return { ok: true, ...session }
+      } catch (error) {
+        return { ok: false, error: messageOf(error) }
+      }
+    },
+
+    /**
+     * Open a shell AT the current workspace cwd, resolving the target without
+     * the user choosing: a cwd under a registered remote anchor opens a remote
+     * shell on that machine, chdir'd to the anchor's remote path (+ subpath);
+     * anything else opens a local shell at that cwd. This is the default
+     * "click Shell" entry — no local/remote chooser.
+     */
+    async openShellAt(cwd, opts) {
+      try {
+        const anchor = typeof cwd === 'string' && cwd !== '' ? findByCwd(cwd) : undefined
+        if (anchor !== undefined) {
+          const machine = (anchor.machineId !== undefined && anchor.machineId !== null ? machineById(anchor.machineId) : undefined)
+            ?? { host: anchor.host, port: anchor.port, user: anchor.user }
+          const remoteCwd = anchor.remoteSubpath === ''
+            ? anchor.remotePath
+            : `${anchor.remotePath.replace(/\/+$/, '')}/${anchor.remoteSubpath}`
+          const session = await shells.openRemote(machine, { ...(opts ?? {}), cwd: remoteCwd })
+          return { ok: true, ...session, cwd: remoteCwd, label: machine.alias || machine.host || '远程' }
+        }
+        const session = await shells.openLocal({ ...(opts ?? {}), cwd })
+        return { ok: true, ...session, cwd: typeof cwd === 'string' && cwd !== '' ? cwd : process.cwd(), label: '本机' }
       } catch (error) {
         return { ok: false, error: messageOf(error) }
       }
@@ -336,6 +382,14 @@ function remoteWorkspacesService(remote) {
     shellRead(id) {
       try {
         return { ok: true, ...shells.read(id) }
+      } catch (error) {
+        return { ok: false, error: messageOf(error) }
+      }
+    },
+
+    async shellResize(id, rows, cols) {
+      try {
+        return { ok: true, ...(await shells.resize(id, rows, cols)) }
       } catch (error) {
         return { ok: false, error: messageOf(error) }
       }

@@ -5,7 +5,7 @@
  *
  * All paths are neutral fixtures (never a real host's drive layout).
  */
-import { toWinPath, psQuote, psCommandEnvelope, buildExecScript, stripPsProgressClixml, crlfToLf, createCrlfToLf, shellQuote, probeRemoteProfile } from '../src/transport.js'
+import { toWinPath, psQuote, psCommandEnvelope, buildExecScript, stripPsProgressClixml, crlfToLf, createCrlfToLf, shellQuote, shellCdCommand, probeRemoteProfile } from '../src/transport.js'
 import { remoteRgCommand } from '../src/search.js'
 
 const results = []
@@ -30,6 +30,18 @@ check('toWinPath leaves relative alone', toWinPath('rel/path') === 'rel/path')
 // --- psQuote ----------------------------------------------------------------
 check('psQuote basic', psQuote('X:/work') === `'X:/work'`)
 check('psQuote escapes apostrophe', psQuote("it's") === `'it''s'`)
+
+// --- shellCdCommand (interactive-shell first input) -------------------------
+{
+  const posix = shellCdCommand({ family: 'posix', os: 'linux', shell: 'posix' }, '/data/work dir')
+  check('cd posix single-quotes', posix === `cd '/data/work dir'\r`, JSON.stringify(posix))
+  const ps = shellCdCommand({ family: 'windows', os: 'windows', shell: 'powershell' }, '/X:/work/demo')
+  check('cd powershell single-quotes forward-slash win path', ps === `cd 'X:/work/demo'\r`, JSON.stringify(ps))
+  const cmd = shellCdCommand({ family: 'windows', os: 'windows', shell: 'cmd' }, '/C:/Windows/Temp')
+  check('cd cmd uses double quotes + backslashes + /d', cmd === `cd /d "C:\\Windows\\Temp"\r`, JSON.stringify(cmd))
+  const unk = shellCdCommand({ family: 'unknown' }, '/x')
+  check('cd unknown falls back to posix form', unk === `cd '/x'\r`)
+}
 
 // --- psCommandEnvelope round-trip -------------------------------------------
 {

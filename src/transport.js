@@ -30,6 +30,22 @@ export function psQuote(value) {
 }
 
 /**
+ * First-input `cd` command that lands an interactive shell channel in `cwd`,
+ * dialect-aware: POSIX single-quotes, PowerShell (cd = Set-Location) single-
+ * quotes a forward-slash win path, and cmd.exe — where single quotes are
+ * literal — uses double quotes + backslashes with `/d` to switch drive too.
+ */
+export function shellCdCommand(profile, cwd) {
+  const p = profile ?? { family: 'unknown' }
+  if (p.family === 'windows') {
+    const winPath = toWinPath(cwd)
+    if (p.shell === 'cmd') return `cd /d "${winPath.replace(/\//g, '\\')}"\r`
+    return `cd ${psQuote(winPath)}\r`
+  }
+  return `cd ${shellQuote(cwd)}\r`
+}
+
+/**
  * Strip PowerShell progress records from a stderr capture. When a nested
  * powershell is launched by a Windows OpenSSH exec channel (e.g. the cmd
  * default-shell wrapper), the engine's first-run module-analysis warm-up emits
@@ -495,6 +511,63 @@ export class SshClient {
       conn.on('error', (err) => { clearTimeout(timer); fail(err) })
       try { conn.connect(this.connectConfig()) } catch (err) { clearTimeout(timer); fail(err) }
     })
+  }
+
+  /**
+   * Open an INTERACTIVE shell channel with a PTY — the remote half of the UI
+   * Shell tool. ssh2 `conn.shell` + a pty is the same mechanism on POSIX and
+   * Windows OpenSSH (ConPTY) remotes; the target's DefaultShell decides whether
+   * the session is a login shell, cmd, or PowerShell, and its OS decides the
+   * line endings. The channel merges stderr into stdout (one data stream) and
+   * the bytes are passed through RAW — a PTY already emits terminal-ready CRLF
+   * that xterm renders directly, so the exec-channel CRLF folding must NOT be
+   * applied here.
+   *
+   * When `cwd` is given, the shell is chdir'd there as its first input (a
+   * dialect-aware `cd`, probed once per target). The shell still starts at the
+   * remote account's home; the `cd` is emitted into the PTY so the prompt and
+   * every later command land in the requested directory.
+   *
+   * Resolves a handle compatible with the local PTY one:
+   *   { output, write, terminate, resize, pid } where `output` is the ssh2
+   *   stream (an EventEmitter emitting 'data' and 'close'), `resize` maps to
+   *   `setWindow` (REACHABLE here, unlike the local seam — the S0 finding), and
+   *   `terminate` closes the channel then ends the connection.
+   */
+  openShell({ rows = 24, cols = 80, term = 'xterm-256color', env, cwd } = {}) {
+    const chdirPromise = cwd !== undefined && cwd !== null && cwd !== ''
+      ? this.profile().then((profile) => shellCdCommand(profile, cwd)).catch(() => '')
+      : Promise.resolve('')
+    return chdirPromise.then((chdir) => new Promise((resolve, reject) => {
+      const conn = new Client()
+      let settled = false
+      const fail = (error) => {
+        if (settled) return
+        settled = true
+        try { conn.end() } catch {}
+        reject(error instanceof Error ? error : new Error(String(error)))
+      }
+      const timer = setTimeout(() => fail(new Error('SSH shell 连接超时')), this.readyTimeoutMs)
+      conn.on('ready', () => {
+        conn.shell({ term, rows, cols, ...(env ? { env } : {}) }, (err, stream) => {
+          if (err) { clearTimeout(timer); fail(err); return }
+          clearTimeout(timer)
+          settled = true
+          let closed = false
+          stream.on('close', () => { closed = true })
+          if (chdir !== '') stream.write(chdir)
+          resolve({
+            output: stream,
+            pid: null,
+            write(data) { if (!closed) { try { stream.write(data) } catch {} } },
+            terminate() { try { stream.close() } catch {} try { conn.end() } catch {} },
+            resize(r, c) { if (!closed) { try { stream.setWindow(r, c) } catch {} } },
+          })
+        })
+      })
+      conn.on('error', (connError) => { clearTimeout(timer); fail(connError) })
+      try { conn.connect(this.connectConfig()) } catch (connectError) { clearTimeout(timer); fail(connectError) }
+    }))
   }
 
   /**
