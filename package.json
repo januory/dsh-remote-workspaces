@@ -14,18 +14,25 @@
   "main": "./src/index.js",
   "exports": {
     ".": "./src/index.js",
-    "./client": "./src/client.js"
+    "./client": "./lib/client.js"
   },
   "files": [
     "src",
     "cordis.patch.yml"
   ],
   "scripts": {
+    "build:client": "node scripts/build-client.mjs",
+    "prepack": "node scripts/build-client.mjs",
     "test": "node test/unit-anchor-path.mjs && node test/unit-secrets-encryption.mjs && node test/unit-fs.mjs && node test/unit-shell.mjs && node test/unit-routing.mjs && node test/unit-remote-policy.mjs && node test/unit-search-registration.mjs && node test/unit-win-remote.mjs && node test/unit-registry-os.mjs",
     "test:integration": "node test/integration-remote.mjs"
   },
   "dependencies": {
     "ssh2": "^1.17.0"
+  },
+  "devDependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^5.5.0",
+    "esbuild": "^0.25.12"
   },
   "dsh": {
     "bundle": {

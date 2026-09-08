@@ -3,19 +3,28 @@
  *
  * 1. A "远程工作区" settings section — a multi-machine SSH registry (add /
  *    edit / delete / test) with `~/.ssh/config` as a one-click form-fill
- *    convenience. NO remote browsing here.
+ *    convenience.
  *
  * 2. A composed directory-flow picker registered into the harness's two
  *    workspace-add holes (`conversation.hero.workspace.directoryFlow` and
  *    `sidebar.workspaces.directoryFlow`) at a lower priority so it shadows the
- *    native chooser and offers BOTH "本地文件夹" (delegates to the host
- *    chooser) and "远程目录" (pick a machine → browse the remote → open it as
- *    a remote workspace → hand the anchor path back through `onPicked`).
+ *    native chooser and offers BOTH "本地文件夹" and "远程目录".
  *
- * Served verbatim as a classic script, so it self-registers through
- * `window.__ModuleLoader__` in factory form (no ESM import/export); `react` is
- * a platform seed word resolved via `require("react")`.
+ * 3. A "Shell" tab type (kind `shell`, guide entry on the 开始/Start page)
+ *    whose body renders a real xterm terminal backed by a local PTY session.
+ *
+ * Built by `scripts/build-client.mjs` (esbuild) into `lib/client.js`: the
+ * bundle registers `window.__ModuleLoader__.load({id, factory})`, keeps `react`
+ * as a platform seed word (resolved by the factory's injected `require`), and
+ * INLINES `@xterm/xterm` + its CSS. `exports["./client"]` points at the built
+ * artifact, so no deepseek-harness source is modified.
  */
+
+import { Terminal } from '@xterm/xterm'
+import { FitAddon } from '@xterm/addon-fit'
+import xtermCss from '@xterm/xterm/css/xterm.css'
+
+var React = require('react')
 
 // ---------------------------------------------------------------------------
 // Remote contract (must match src/index.js). Parameters carry strict codecs
@@ -57,6 +66,11 @@ var INVOCATIONS = [
   invocation('testConnection', [jsonParameter('machine')]),
   invocation('listRemoteDir', [jsonParameter('machine'), jsonParameter('path')]),
   invocation('openRemoteWorkspace', [jsonParameter('machine'), jsonParameter('path')]),
+  invocation('openShellLocal', [jsonParameter('opts')]),
+  invocation('shellWrite', [jsonParameter('id'), jsonParameter('data')]),
+  invocation('shellRead', [jsonParameter('id')]),
+  invocation('shellClose', [jsonParameter('id')]),
+  invocation('shellList'),
 ]
 
 function unwrapRemote(res) {
@@ -67,13 +81,6 @@ function unwrapRemote(res) {
   }
   return res.value || { ok: false, error: '空结果' }
 }
-
-window.__ModuleLoader__.load({
-  id: PACKAGE,
-  factory: (require) => {
-    var module = { exports: {} }
-    var exports = module.exports
-    var React = require('react')
 
     var sectionStyle = { padding: 16, fontSize: 14, lineHeight: 1.6, maxWidth: 820, color: 'inherit' }
     var labelStyle = { color: '#8b8f98', margin: 0, fontSize: 12.5 }
@@ -796,7 +803,208 @@ window.__ModuleLoader__.load({
       )
     }
 
-    exports.inject = ['slots', 'remote', 'uiWorkspace']
+    // =========================================================================
+    // Shell tab: a real xterm terminal driving a local (S0) PTY session.
+    // =========================================================================
+    function ShellBody(props) {
+      var getRemote = props.getRemote
+      var containerRef = React.useRef(null)
+      var termRef = React.useRef(null)
+      var sessionRef = React.useRef(null)
+      var timerRef = React.useRef(null)
+      var statusState = React.useState('connecting')
+      var status = statusState[0]
+      var setStatus = statusState[1]
+      var errState = React.useState(null)
+      var err = errState[0]
+      var setErr = errState[1]
+
+      React.useEffect(function () {
+        var disposed = false
+        var el = containerRef.current
+        if (!el) return undefined
+
+        var fg = resolveShellFg()
+
+        var term = new Terminal({
+          cursorBlink: true,
+          fontSize: 13,
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+          scrollback: 2000,
+          convertEol: false,
+          allowTransparency: true,
+          theme: { background: 'transparent', foreground: fg, cursor: fg, cursorAccent: 'transparent' },
+        })
+        var fitAddon = new FitAddon()
+        term.loadAddon(fitAddon)
+        termRef.current = term
+        term.open(el)
+        term.focus()
+
+        // Follow theme switches (dark <-> light): the pane background is
+        // transparent, so the foreground must re-resolve or light-mode text
+        // turns white-on-white.
+        var themeObserver = null
+        if (typeof MutationObserver !== 'undefined' && document.body) {
+          themeObserver = new MutationObserver(function () {
+            if (disposed) return
+            var next = resolveShellFg()
+            try { term.options.theme = { background: 'transparent', foreground: next, cursor: next, cursorAccent: 'transparent' } } catch (e2) { /* noop */ }
+          })
+          themeObserver.observe(document.body, { attributes: true, attributeFilter: ['data-ds-dark-theme'] })
+        }
+
+        var ns = getRemote()
+        if (!ns) {
+          setStatus('error')
+          setErr('Remote 命名空间未就绪')
+          term.writeln('\x1b[31m[shell] Remote 命名空间未就绪\x1b[0m')
+          return undefined
+        }
+
+        term.writeln('\x1b[36m[shell] 正在打开本机终端…\x1b[0m')
+
+        var opened = false
+        var ro = null
+        var rafId = 0
+
+        function openWithFittedSize() {
+          if (disposed || opened) return
+          opened = true
+          if (ro !== null) { ro.disconnect(); ro = null }
+          if (rafId) { cancelAnimationFrame(rafId); rafId = 0 }
+          try { fitAddon.fit() } catch (e) { /* keep default rows/cols */ }
+          ns.openShellLocal({ rows: term.rows, cols: term.cols }).then(
+            function (res) {
+              if (disposed) return
+              var b = unwrapRemote(res)
+              if (!b.ok) {
+                setStatus('error')
+                setErr(b.error || '打开失败')
+                term.writeln('\x1b[31m[shell] ' + (b.error || '打开失败') + '\x1b[0m')
+                return
+              }
+              sessionRef.current = b.id
+              setStatus('open')
+              function tick() {
+                if (disposed) return
+                var id = sessionRef.current
+                if (!id) return
+                ns.shellRead(id).then(
+                  function (r) {
+                    if (disposed) return
+                    var out = unwrapRemote(r)
+                    if (out.ok && out.text) term.write(out.text)
+                    timerRef.current = setTimeout(tick, 60)
+                  },
+                  function () {
+                    if (disposed) return
+                    timerRef.current = setTimeout(tick, 60)
+                  },
+                )
+              }
+              timerRef.current = setTimeout(tick, 60)
+            },
+            function (e) {
+              if (disposed) return
+              setStatus('error')
+              setErr(e && e.message ? e.message : String(e))
+              term.writeln('\x1b[31m[shell] ' + (e && e.message ? e.message : String(e)) + '\x1b[0m')
+            },
+          )
+        }
+
+        // Wait for the flex chain to give the container real dimensions, then
+        // fit once and open the PTY at the fitted rows/cols so the terminal
+        // content actually fills the pane (not just the viewport background).
+        if (typeof ResizeObserver !== 'undefined') {
+          ro = new ResizeObserver(function (entries) {
+            var r = entries[0] && entries[0].contentRect
+            if (r && r.height > 0 && r.width > 0) openWithFittedSize()
+          })
+          ro.observe(el)
+        }
+        var attempt = function () {
+          if (disposed || opened) return
+          if (el.clientHeight > 0 && el.clientWidth > 0) { openWithFittedSize(); return }
+          rafId = requestAnimationFrame(attempt)
+        }
+        rafId = requestAnimationFrame(attempt)
+
+        var dataDisposable = term.onData(function (data) {
+          var id = sessionRef.current
+          if (id && ns) ns.shellWrite(id, data)
+        })
+
+        return function () {
+          disposed = true
+          if (ro !== null) ro.disconnect()
+          if (themeObserver !== null) themeObserver.disconnect()
+          if (rafId) cancelAnimationFrame(rafId)
+          if (timerRef.current) clearTimeout(timerRef.current)
+          if (dataDisposable && dataDisposable.dispose) dataDisposable.dispose()
+          var id = sessionRef.current
+          if (id && ns) ns.shellClose(id)
+          if (termRef.current) { try { termRef.current.dispose() } catch (e2) { /* noop */ } }
+          termRef.current = null
+          sessionRef.current = null
+        }
+      }, [])
+
+      return React.createElement(
+        'div',
+        { className: 'dsh-rw-shell', style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, overflow: 'hidden' } },
+        err !== null
+          ? React.createElement('div', { style: { flex: '0 0 auto', padding: '6px 10px', color: '#e5484d', fontFamily: 'ui-monospace, monospace', fontSize: 12, whiteSpace: 'pre-wrap' } }, err)
+          : null,
+        React.createElement('div', { ref: containerRef, style: { flex: 1, minHeight: 0, width: '100%' } }),
+      )
+    }
+
+    // Terminal glyph for the 开始 page entry box (drawn at 16px; color rides currentColor).
+    function ShellIcon(props) {
+      var size = props && props.size ? props.size : 16
+      return React.createElement('svg', {
+        width: size,
+        height: size,
+        viewBox: '0 0 16 16',
+        fill: 'none',
+        stroke: 'currentColor',
+        strokeWidth: 1.5,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+        'aria-hidden': 'true',
+        xmlns: 'http://www.w3.org/2000/svg',
+      },
+        React.createElement('rect', { x: 1.5, y: 2.5, width: 13, height: 11, rx: 2 }),
+        React.createElement('path', { d: 'M4.5 5.5 L7 8 L4.5 10.5' }),
+        React.createElement('line', { x1: 8, y1: 10.5, x2: 11.5, y2: 10.5 }),
+      )
+    }
+
+    // Foreground for the xterm: the theme's primary label color, with a
+    // dark/light fallback. `--dsw-alias-label-primary` is dark in light mode
+    // and light in dark mode; resolving it through a real DOM probe follows the
+    // active theme exactly, while the attribute fallback keeps the shell
+    // readable if the probe ever fails (or the token is unavailable).
+    function resolveShellFg() {
+      var dark = false
+      try { dark = document.body !== null && document.body.hasAttribute('data-ds-dark-theme') } catch (e) { /* default light */ }
+      var fallback = dark ? '#e6edf3' : '#0f1115'
+      try {
+        if (typeof document !== 'undefined' && typeof getComputedStyle === 'function' && document.body) {
+          var probe = document.createElement('div')
+          probe.style.color = 'var(--dsw-alias-label-primary)'
+          document.body.appendChild(probe)
+          var resolved = getComputedStyle(probe).color
+          document.body.removeChild(probe)
+          if (resolved && resolved !== 'rgba(0, 0, 0, 0)' && resolved !== 'transparent') return resolved
+        }
+      } catch (e) { /* use fallback */ }
+      return fallback
+    }
+
+    exports.inject = ['slots', 'remote', 'uiWorkspace', 'sidebarRightTabs']
 
     exports.apply = function apply(ctx) {
       // Inject a small set of theme-aware control styles (hover / focus /
@@ -821,6 +1029,17 @@ window.__ModuleLoader__.load({
         document.head.appendChild(styleEl)
       }
 
+      // Inject xterm's stylesheet (inlined as text by the esbuild build).
+      if (typeof document !== 'undefined' && document.head && xtermCss && !document.getElementById('dsh-rw-xterm')) {
+        var xtermStyle = document.createElement('style')
+        xtermStyle.id = 'dsh-rw-xterm'
+        xtermStyle.textContent = xtermCss
+          + '\n.dsh-rw-shell .xterm{height:100%}'
+          + '\n.dsh-rw-shell .xterm-viewport{background-color:transparent!important}'
+          + '\n.dsh-rw-shell .xterm-screen{background-color:transparent!important}'
+        document.head.appendChild(xtermStyle)
+      }
+
       var mount = ctx.remote.$mount({ package: PACKAGE, descriptors: INVOCATIONS })
       var getRemote = function () { return ctx.get('remote.' + NAMESPACE) }
 
@@ -834,6 +1053,30 @@ window.__ModuleLoader__.load({
               getRemote: getRemote,
             })
           },
+        )
+      })
+
+      // Shell tab type + body (real xterm terminal; S0 = local shell only).
+      var SHELL_KIND = 'shell'
+      var SHELL_ID = 'dsh-remote-workspaces/shell'
+      ctx.effect(function () {
+        return ctx.sidebarRightTabs.register({
+          id: SHELL_ID,
+          kind: SHELL_KIND,
+          priority: 'extension',
+          title: function () { return 'Shell' },
+          guide: [{
+            order: 20,
+            title: function () { return 'Shell' },
+            description: function () { return '打开本机或远程主机的交互终端' },
+            icon: ShellIcon,
+          }],
+        })
+      })
+      ctx.slots.inject('sidebar.right.pane.tab', function () {
+        return ctx.slots.register(
+          { name: 'sidebar.right.pane.tab', key: SHELL_ID, inject: function () { return { getRemote: getRemote } } },
+          ShellBody,
         )
       })
 
@@ -857,7 +1100,3 @@ window.__ModuleLoader__.load({
         })
       })
     }
-
-    return module.exports
-  },
-})

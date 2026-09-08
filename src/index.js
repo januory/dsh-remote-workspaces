@@ -6,6 +6,7 @@ import { RoutingFileSystem } from './routing-fs.js'
 import { SshShellExecutor } from './shell-exec.js'
 import { registerAnchor, unregisterAnchor, findByCwd, updateAnchorOs } from './registry.js'
 import { applySearchTools } from './search.js'
+import { createShellSessions } from './shell-sessions.js'
 
 export { parseSshConfig, expandTilde } from './ssh-config.js'
 export { SshClient, hostsFromConfig, shellQuote, defaultSshConfigPath, clientForHost } from './transport.js'
@@ -69,6 +70,11 @@ const INVOCATIONS = [
   invocation('testConnection', [jsonParameter('machine')]),
   invocation('listRemoteDir', [jsonParameter('machine'), jsonParameter('path')]),
   invocation('openRemoteWorkspace', [jsonParameter('machine'), jsonParameter('path')]),
+  invocation('openShellLocal', [jsonParameter('opts')]),
+  invocation('shellWrite', [jsonParameter('id'), jsonParameter('data')]),
+  invocation('shellRead', [jsonParameter('id')]),
+  invocation('shellClose', [jsonParameter('id')]),
+  invocation('shellList'),
 ]
 
 /** Build an `SshClient` from a machine record (alias/host/port/user/identityFile). */
@@ -183,7 +189,8 @@ async function resolveRemotePath(client, raw, sharedSftp) {
  * Host owner of the `remoteWorkspaces` Remote namespace. Every method returns
  * only lossless-JSON data and never echoes stored secrets back to the browser.
  */
-function remoteWorkspacesService() {
+function remoteWorkspacesService(remote) {
+  const shells = createShellSessions(() => remote.getSubprocess())
   return {
     listMachines() {
       return { ok: true, machines: loadMachines().map(sanitizeMachine) }
@@ -306,6 +313,45 @@ function remoteWorkspacesService() {
         sftp.end()
       }
     },
+
+    // Shell tool (S0: interactive local shell over ctx.subprocess.spawnTerminal).
+    async openShellLocal(opts) {
+      try {
+        const session = await shells.openLocal(opts ?? {})
+        return { ok: true, ...session }
+      } catch (error) {
+        return { ok: false, error: messageOf(error) }
+      }
+    },
+
+    async shellWrite(id, data) {
+      try {
+        await shells.write(id, data)
+        return { ok: true }
+      } catch (error) {
+        return { ok: false, error: messageOf(error) }
+      }
+    },
+
+    shellRead(id) {
+      try {
+        return { ok: true, ...shells.read(id) }
+      } catch (error) {
+        return { ok: false, error: messageOf(error) }
+      }
+    },
+
+    async shellClose(id) {
+      try {
+        return { ok: true, ...(await shells.close(id)) }
+      } catch (error) {
+        return { ok: false, error: messageOf(error) }
+      }
+    },
+
+    shellList() {
+      return { ok: true, sessions: shells.list() }
+    },
   }
 }
 
@@ -334,7 +380,7 @@ export function apply(ctx) {
   ctx.provide('fs', new RoutingFileSystem(remote))
   ctx.provide('shell', new SshShellExecutor(remote))
 
-  const service = remoteWorkspacesService()
+  const service = remoteWorkspacesService(remote)
   service.typertRemote = Object.freeze({ service, serviceKey: NAMESPACE, namespace: NAMESPACE })
   ctx.provide(NAMESPACE, service)
 
