@@ -9,7 +9,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { join, sep } from 'node:path'
+import { join } from 'node:path'
 import { remoteWorkspacesRoot } from './anchor.js'
 
 function anchorsPath() {
@@ -64,27 +64,36 @@ export function unregisterAnchor(anchorPath) {
 }
 
 /**
- * Resolve a session cwd (the anchor path, or any descendant) to its remote
- * origin. Returns `{ anchorPath, remotePath, remoteSubpath, host, port, user, machineId }`
- * or `undefined` when the cwd is not under any registered anchor.
+ * Resolve a session cwd — the anchor path, any descendant, or the Files tree's
+ * `/`-joined child spelling of either — to its remote origin. Returns
+ * `{ anchorPath, remotePath, remoteSubpath, host, port, user, machineId }` or
+ * `undefined` when the cwd is not under any registered anchor.
+ *
+ * Matching is done on separator-normalized forms: anchor keys are stored with
+ * the native `sep` (`\` on Windows), while harness session cwds and the right
+ * Sidebar Files tree spell paths with `/` (and children are `root + '/' + name`
+ * even when the root is `\`-spelled). `remoteSubpath` is always `/`-joined.
  */
 export function findByCwd(cwd) {
   if (typeof cwd !== 'string' || cwd === '') return undefined
   const anchors = loadAnchors()
+  const flat = (p) => p.replace(/\\/g, '/')
+  const query = flat(cwd)
   let best
   let bestLen = -1
   for (const [anchorPath, rec] of Object.entries(anchors)) {
-    const base = anchorPath.endsWith(sep) ? anchorPath : anchorPath + sep
-    if (cwd === anchorPath || cwd.startsWith(base)) {
-      if (anchorPath.length > bestLen) {
-        bestLen = anchorPath.length
-        best = { anchorPath, ...rec }
+    const base = flat(anchorPath)
+    const prefix = base.endsWith('/') ? base : `${base}/`
+    if (query === base || query.startsWith(prefix)) {
+      if (base.length > bestLen) {
+        bestLen = base.length
+        best = { anchorPath, base, rec }
       }
     }
   }
   if (best === undefined) return undefined
-  const rel = cwd === best.anchorPath ? '' : cwd.slice(best.anchorPath.length + sep.length)
-  return { ...best, remoteSubpath: rel === '' ? '' : rel.split(sep).join('/') }
+  const rel = query === best.base ? '' : query.slice(best.base.length + 1)
+  return { ...best.rec, anchorPath: best.anchorPath, remoteSubpath: rel }
 }
 
 export default { loadAnchors, registerAnchor, unregisterAnchor, updateAnchorOs, findByCwd, remoteWorkspacesRoot }

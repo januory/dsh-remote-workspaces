@@ -1,10 +1,14 @@
 /**
  * Routing filesystem: the plugin's `ctx.fs` provider.
  *
- * Routes by the session cwd. Two remote triggers:
- *   - an `ssh://[user@]host[:port]/path` cwd (URI form), and
+ * Routes by the session cwd OR by the path itself. Remote triggers:
+ *   - an `ssh://[user@]host[:port]/path` cwd (URI form),
  *   - a LOCAL anchor directory registered in the remote-workspace registry
- *     (`anchors.json`), whose real content lives on the remote host.
+ *     (`anchors.json`), whose real content lives on the remote host, and
+ *   - any absolute path that IS a registered anchor or sits under one (the
+ *     anchor path is the remote world's local alias — the Files tree lists,
+ *     expands and opens entirely in this spelling, so routing must answer it
+ *     with or without an anchor cwd).
  * Everything else goes to the local backend (with the workspace-write fence).
  *
  * The world identity is ENCODED into the target key (`ssh://host/path` for
@@ -75,6 +79,41 @@ export class RoutingFileSystem {
     return `ssh://${user ? `${user}@` : ''}${host}${port ? `:${port}` : ''}${subKey}`
   }
 
+  /**
+   * Anchor alias of an absolute LOCAL path: a registered anchor dir — or any
+   * path under one — is the remote world's local spelling, so the registry
+   * lookup that maps a session cwd maps the path itself. Returns the remote
+   * origin (`{ host, user, port, remotePath }`) when `path` is an anchor dir or
+   * a descendant of one, else null. This is what lets the right Sidebar Files
+   * tree (which roots at the anchor path and joins children with `/`) reach the
+   * remote: those strings ARE remote aliases.
+   */
+  aliasOfPath(path) {
+    if (typeof path !== 'string' || path === '') return null
+    const hit = findByCwd(path)
+    if (hit === undefined) return null
+    return {
+      host: hit.host,
+      user: hit.user,
+      port: hit.port,
+      remotePath: hit.remoteSubpath === '' ? hit.remotePath : posix.join(hit.remotePath, hit.remoteSubpath),
+    }
+  }
+
+  /** Remote routing params for a call, from its cwd first and its path second. */
+  routeRemote(path, cwd) {
+    const byCwd = this.remoteCwd(cwd)
+    if (byCwd !== null) return byCwd
+    const byPath = this.aliasOfPath(path)
+    return byPath === null ? null : { ...byPath, remoteCwd: byPath.remotePath }
+  }
+
+  /** The path argument translated to the remote world when it is itself an alias. */
+  remotePathArg(path) {
+    const alias = this.aliasOfPath(path)
+    return alias === null ? path : alias.remotePath
+  }
+
   /** Decode a target key into { backend, target } using the encoded world prefix. */
   splitTarget(target) {
     const key = String(target.targetKey)
@@ -92,10 +131,17 @@ export class RoutingFileSystem {
 
   async resolve(path, opts) {
     const cwd = opts && opts.cwd
-    const remote = this.remoteCwd(cwd)
+    // Remote by cwd (session anchor), or by the path itself when no remote cwd
+    // is given — the Files endpoint resolves the workspace root WITHOUT a cwd,
+    // and the root is the anchor path, so the path must trigger routing alone.
+    const remote = this.routeRemote(path, cwd)
     if (remote !== null) {
       const backend = this.remoteBackend(remote.host, remote.user, remote.port)
-      const sub = await backend.resolve(path, { cwd: remote.remoteCwd })
+      // An anchor-absolute path (the Files vocabulary) is translated to its
+      // remote spelling here; a relative path under an anchor cwd passes
+      // through unchanged so the backend's cwd resolution applies as before.
+      const arg = this.remotePathArg(path)
+      const sub = await backend.resolve(arg, { cwd: remote.remoteCwd })
       return {
         targetKey: this.encodeTarget(remote.host, remote.user, remote.port, sub.targetKey),
         displayPath: sub.displayPath,
@@ -135,10 +181,11 @@ export class RoutingFileSystem {
 
   lstat(path, opts, signal) {
     const cwd = opts && opts.cwd
-    const remote = this.remoteCwd(cwd)
+    const remote = this.routeRemote(path, cwd)
     if (remote !== null) {
       const backend = this.remoteBackend(remote.host, remote.user, remote.port)
-      return backend.lstat(path, { cwd: remote.remoteCwd })
+      const arg = this.remotePathArg(path)
+      return backend.lstat(arg, { cwd: remote.remoteCwd })
     }
     return this.local.lstat(path, opts)
   }

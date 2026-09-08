@@ -40,6 +40,17 @@ check('updateAnchorOs on unknown row is a no-op', updateAnchorOs(join(home, 'nop
 // registerAnchor os stays optional / non-os rows unaffected by update of others.
 check('non-os anchor unaffected elsewhere', findByCwd(anchor2)?.os?.shell === 'powershell')
 
+// Separator normalization: '/'-spelled paths hit '\'-stored anchor keys (the
+// harness sessions and the right-Sidebar Files tree spell paths with '/').
+const flat = anchor.replace(/\\/g, '/')
+hit = findByCwd(`${flat}/sub/dir/file.txt`)
+check('findByCwd matches slash-spelled descendant', hit !== undefined && hit.remoteSubpath === 'sub/dir/file.txt', JSON.stringify(hit && hit.remoteSubpath))
+hit = findByCwd(flat)
+check('findByCwd matches slash-spelled anchor root', hit !== undefined && hit.remoteSubpath === '', JSON.stringify(hit && hit.remoteSubpath))
+const flat2 = anchor2.replace(/\\/g, '/')
+check('os row reachable through slash spelling', findByCwd(`${flat2}/x`)?.os?.family === 'windows')
+check('unrelated path still misses', findByCwd(`${home.replace(/\\/g, '/')}/elsewhere`) === undefined)
+
 rmSync(home, { recursive: true, force: true })
 const failed = results.filter((r) => !r.ok)
 console.log(`\n${results.length - failed.length}/${results.length} passed`)
