@@ -7,6 +7,7 @@ import { SshShellExecutor } from './shell-exec.js'
 import { registerAnchor, unregisterAnchor, findByCwd, updateAnchorOs } from './registry.js'
 import { applySearchTools } from './search.js'
 import { createShellSessions } from './shell-sessions.js'
+import { expandLocalTarget, localHome, localDriveRoots, localLevelListing, localListError, LOCAL_DRIVES } from './local-browse.js'
 
 export { parseSshConfig, expandTilde } from './ssh-config.js'
 export { SshClient, hostsFromConfig, shellQuote, defaultSshConfigPath, clientForHost } from './transport.js'
@@ -69,6 +70,7 @@ const INVOCATIONS = [
   invocation('sshAliasDetail', [jsonParameter('alias')]),
   invocation('testConnection', [jsonParameter('machine')]),
   invocation('listRemoteDir', [jsonParameter('machine'), jsonParameter('path')]),
+  invocation('listLocalDir', [jsonParameter('path')]),
   invocation('openRemoteWorkspace', [jsonParameter('machine'), jsonParameter('path')]),
   invocation('openShellLocal', [jsonParameter('opts')]),
   invocation('openShellRemote', [jsonParameter('machine'), jsonParameter('opts')]),
@@ -271,6 +273,28 @@ function remoteWorkspacesService(remote) {
         return { ok: false, error: `无法解析目录：${messageOf(error)}` }
       } finally {
         sftp.end()
+      }
+    },
+
+    async listLocalDir(path) {
+      // Virtual Windows drive-selection level: '上一级' at a drive root.
+      if (typeof path === 'string' && path === LOCAL_DRIVES) {
+        try {
+          const roots = await localDriveRoots()
+          const entries = roots.map((r) => ({ name: r.slice(0, 2), dir: true }))
+          return { ok: true, path: '', entries, truncated: false }
+        } catch (error) {
+          return { ok: false, error: '无法读取盘符：' + messageOf(error) }
+        }
+      }
+      let target = ''
+      try {
+        const home = localHome()
+        target = expandLocalTarget(path, home)
+        const level = await localLevelListing(target, {})
+        return { ok: true, path: level.path, entries: level.entries, truncated: level.truncated }
+      } catch (error) {
+        return { ok: false, error: localListError(error, target || (typeof path === 'string' ? path : '')) }
       }
     },
 

@@ -65,6 +65,7 @@ var INVOCATIONS = [
   invocation('sshAliasDetail', [jsonParameter('alias')]),
   invocation('testConnection', [jsonParameter('machine')]),
   invocation('listRemoteDir', [jsonParameter('machine'), jsonParameter('path')]),
+  invocation('listLocalDir', [jsonParameter('path')]),
   invocation('openRemoteWorkspace', [jsonParameter('machine'), jsonParameter('path')]),
   invocation('openShellLocal', [jsonParameter('opts')]),
   invocation('openShellRemote', [jsonParameter('machine'), jsonParameter('opts')]),
@@ -551,6 +552,156 @@ function unwrapRemote(res) {
       return idx <= 0 ? '/' : s.slice(0, idx)
     }
 
+    // -----------------------------------------------------------------------
+    // Remote-access discrimination for the LOCAL folder tab (pure origin rule,
+    // plugin-agnostic — any remote proxy/portal serves the page from its own
+    // non-loopback host, so only a page direct from the host's own loopback is
+    // treated as local). Mirrors dsh's own isLoopbackHostname semantics.
+    // -----------------------------------------------------------------------
+    function isLoopbackHostname(hostname) {
+      var h = String(hostname || '').toLowerCase()
+      if (h === 'localhost' || h === '[::1]' || h === '::1') return true
+      var parts = h.split('.')
+      return parts.length === 4 && parts[0] === '127'
+        && parts.every(function (part) { return /^\d{1,3}$/.test(part) && Number(part) <= 255 })
+    }
+
+    // True when the page is NOT served from the host's own loopback: remote
+    // access (e.g. via the dsh gateway portal) — the OS chooser would open on
+    // an unattended desktop, so the local tab must browse in-app instead.
+    function pageIsRemote() {
+      try {
+        if (typeof location === 'undefined' || location === null || !location.hostname) return true
+        return !isLoopbackHostname(location.hostname)
+      } catch (e) { return true }
+    }
+
+    // Local browse keeps paths in '/' canonical form (the host resolves either
+    // separator); '..' requests walk up through the host's platform resolver.
+    function canonicalLocal(p) { return String(p || '').replace(/\\/g, '/') }
+    function localUpPath(p) { return canonicalLocal(p).replace(/\/+$/, '') + '/..' }
+    function localIsDriveRoot(p) { return /^[A-Za-z]:\/$/.test(canonicalLocal(p)) }
+
+    // Virtual Windows drive-selection level (keep in sync with src/local-browse.js).
+    var LOCAL_DRIVES_REQUEST = '::drives::'
+
+    // In-app browser for the LOCAL filesystem (shown when the page is NOT
+    // served from the host's own loopback — remote access cannot see an OS
+    // chooser that opens on the host desktop). Same interaction as the remote
+    // pane: path bar + one-level listing + 上一级/跳转, open adopts the path.
+    function LocalDirectoryBrowse(props) {
+      var getRemote = props.getRemote
+      var onPicked = props.onPicked
+      var busy = props.busy
+      var isMobile = props.isMobile
+      var browseState = React.useState(null)
+      var browse = browseState[0]
+      var setBrowse = browseState[1]
+      var pathInputState = React.useState('')
+      var pathInput = pathInputState[0]
+      var setPathInput = pathInputState[1]
+
+      function load(path) {
+        var ns = getRemote()
+        if (!ns) {
+          setBrowse({ loading: false, error: 'Remote 命名空间未就绪', path: '', entries: [], truncated: false })
+          return
+        }
+        setBrowse({ loading: true, error: null, path: typeof path === 'string' && path !== '' ? canonicalLocal(path) : '', entries: [], truncated: false })
+        // Always pass exactly one argument (Typert counts arguments): '' = home.
+        ns.listLocalDir(typeof path === 'string' && path !== '' ? path : '').then(
+          function (res) {
+            var b = unwrapRemote(res)
+            setBrowse(function (prev) {
+              if (!prev || !prev.loading) return prev
+              if (b.ok) return { loading: false, error: null, path: canonicalLocal(b.path), virtual: !b.path, entries: b.entries || [], truncated: !!b.truncated }
+              return { loading: false, error: b.error || '列出目录失败', path: '', entries: [], truncated: false }
+            })
+          },
+          function (err) {
+            setBrowse(function (prev) {
+              if (!prev || !prev.loading) return prev
+              return { loading: false, error: err && err.message ? err.message : String(err), path: '', entries: [], truncated: false }
+            })
+          },
+        )
+      }
+
+      // Fresh listing of the host home directory on open ('' = home).
+      React.useEffect(function () { load('') }, [])
+
+      // Keep the path input in sync with the listed directory.
+      React.useEffect(function () {
+        if (browse && browse.path !== undefined && browse.path !== null) setPathInput(browse.path)
+        else setPathInput('')
+      }, [browse && browse.path])
+
+      function navigate(name) {
+        if (!browse) return
+        // Virtual drive level: its rows ARE drive roots ('C:' → 'C:/').
+        if (browse.virtual) { load(name + '/'); return }
+        if (!browse.path) return
+        load(browse.path.replace(/\/+$/, '') + '/' + name)
+      }
+      function goUp() {
+        if (!browse || !browse.path || browse.virtual) return
+        // At a Windows drive root there is no real '..' (it resolves back to the
+        // same root): step up to the virtual drive-selection level instead.
+        if (localIsDriveRoot(browse.path)) { load(LOCAL_DRIVES_REQUEST); return }
+        load(localUpPath(browse.path))
+      }
+      function jumpTo() {
+        var v = pathInput.trim()
+        if (v !== '') load(v)
+      }
+      function confirmOpen() {
+        if (browse && browse.path && !browse.loading && !busy) onPicked(browse.path)
+      }
+
+      var disabled = !browse || browse.loading
+      var atFilesystemTop = !browse || browse.virtual || !browse.path || canonicalLocal(browse.path) === '/'
+      var rows = (browse ? browse.entries : []) || []
+      return React.createElement('div', { style: { border: '1px solid ' + borderColor, borderRadius: 6, padding: 10 } },
+        React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' } },
+          React.createElement('input', {
+            type: 'text',
+            value: pathInput,
+            onChange: function (e) { setPathInput(e.target.value) },
+            onKeyDown: function (e) { if (e.key === 'Enter') jumpTo() },
+            placeholder: '输入绝对路径，或 ~ 回到主目录',
+            spellCheck: false,
+            style: Object.assign({}, monoStyle, isMobile
+              ? { flex: '1 1 100%', minWidth: 0, padding: '9px 8px', fontSize: 16, boxSizing: 'border-box' }
+              : { flex: 1, minWidth: 0, padding: '5px 8px', fontSize: 13, boxSizing: 'border-box' }),
+          }),
+          React.createElement('button', { type: 'button', onClick: jumpTo, disabled: disabled, style: Object.assign({}, btnStyle, isMobile ? { flex: 1 } : {}, isMobile ? mobileBtnStyle : {}) }, '跳转'),
+          React.createElement('button', { type: 'button', onClick: goUp, disabled: disabled || atFilesystemTop, style: Object.assign({}, btnStyle, isMobile ? { flex: 1 } : {}, isMobile ? mobileBtnStyle : {}) }, '上一级'),
+        ),
+        browse && browse.loading
+          ? React.createElement('div', { style: labelStyle }, '加载中…')
+          : browse && browse.error
+            ? React.createElement('div', { style: { color: dangerColor, margin: 0 } }, browse.error)
+            : browse
+              ? React.createElement('div', { style: { maxHeight: 220, overflow: 'auto', border: '1px solid ' + borderColor, borderRadius: 6 } },
+                  rows.slice().sort(function (a, b) {
+                    if (a.dir !== b.dir) return a.dir ? -1 : 1
+                    var an = a.name.toLowerCase()
+                    var bn = b.name.toLowerCase()
+                    return an < bn ? -1 : an > bn ? 1 : 0
+                  }).map(function (e) {
+                    return React.createElement(EntryRow, { key: (e.dir ? 'd:' : 'f:') + e.name, entry: e, onOpen: navigate })
+                  }),
+                )
+              : null,
+        browse && browse.truncated
+          ? React.createElement('div', { style: Object.assign({}, labelStyle, { marginTop: 6 }) }, '目录项过多，仅显示前 1000 条')
+          : null,
+        React.createElement('div', { style: { marginTop: 10 } },
+          React.createElement('button', { type: 'button', onClick: confirmOpen, disabled: disabled || busy || !browse || !browse.path, style: Object.assign({}, btnPrim, isMobile ? { width: '100%' } : {}, isMobile ? btnPrimMob : {}) }, '打开此目录'),
+        ),
+      )
+    }
+
     // One remote directory/file row: directories render first with a folder
     // icon and are clickable; files render below with a muted style.
     function EntryRow(props) {
@@ -620,6 +771,9 @@ function unwrapRemote(res) {
       var pathInput = pathInputState[0]
       var setPathInput = pathInputState[1]
       var isMobile = useIsMobile()
+      // Not served from the host's own loopback (remote access): the OS folder
+      // chooser would open on an unattended desktop — use the in-app browser.
+      var remoteAccess = pageIsRemote()
 
       // Reset per open edge, then load machines.
       React.useEffect(function () {
@@ -740,10 +894,12 @@ function unwrapRemote(res) {
             React.createElement('button', { type: 'button', onClick: function () { setMode('remote') }, style: Object.assign({}, btnStyle, isMobile ? { flex: 1 } : {}, isMobile ? mobileBtnStyle : {}, mode === 'remote' ? { background: '#6e56cf', color: '#fff', border: '1px solid transparent' } : {}) }, '远程目录'),
           ),
           mode === 'local'
-            ? React.createElement('div', {},
-                React.createElement('p', { style: { margin: '0 0 12px' } }, '在本机打开系统文件夹选择器，选取一个本地目录作为工作区。'),
-                React.createElement('button', { type: 'button', onClick: doLocal, disabled: localPicking || busy, style: Object.assign({}, btnStyle, isMobile ? { width: '100%' } : {}, isMobile ? mobileBtnStyle : {}) }, localPicking ? '等待选择…' : '选择本地文件夹'),
-              )
+            ? remoteAccess
+              ? React.createElement(LocalDirectoryBrowse, { getRemote: getRemote, onPicked: onPicked, busy: busy, isMobile: isMobile })
+              : React.createElement('div', {},
+                  React.createElement('p', { style: { margin: '0 0 12px' } }, '在本机打开系统文件夹选择器，选取一个本地目录作为工作区。'),
+                  React.createElement('button', { type: 'button', onClick: doLocal, disabled: localPicking || busy, style: Object.assign({}, btnStyle, isMobile ? { width: '100%' } : {}, isMobile ? mobileBtnStyle : {}) }, localPicking ? '等待选择…' : '选择本地文件夹'),
+                )
             : React.createElement('div', {},
                 React.createElement('div', { style: { marginBottom: 8 } }, '选择 SSH 主机（在「设置 → 远程工作区」中配置）：'),
                 machinesLoaded && machines.length === 0
