@@ -87,9 +87,15 @@ check('drives sentinel is not a real path', (() => {
 const posixRoots = await localDriveRoots('linux')
 check('non-win32 has no drive list', Array.isArray(posixRoots) && posixRoots.length === 0)
 const winRoots = await localDriveRoots('win32')
-check('win32 lists drive roots', Array.isArray(winRoots)
-  && winRoots.length > 0
-  && winRoots.every((r) => /^[A-Za-z]:\\$/.test(r)), JSON.stringify(winRoots.slice(0, 6)))
+// The 'win32' platform argument only opens the enumeration branch — the probe
+// still hits the REAL filesystem ('C:\', …), which only exists on a win32 host.
+// On a POSIX host an empty result is expected, so only shape is asserted there.
+const winShape = Array.isArray(winRoots) && winRoots.every((r) => /^[A-Za-z]:\\$/.test(r))
+if (process.platform === 'win32') {
+  check('win32 host lists drive roots', winShape && winRoots.length > 0, JSON.stringify(winRoots.slice(0, 6)))
+} else {
+  check('win32-mode probe shape (empty on posix host)', winShape)
+}
 
 // ── 4. error message mapping ──────────────────────────────────────────────────
 check('ENOENT maps to 目录不存在', localListError(Object.assign(new Error('x'), { code: 'ENOENT' }), '/nope').startsWith('目录不存在：/nope'))
