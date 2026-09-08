@@ -136,6 +136,27 @@ check('openRemote without backend throws', threw === true)
   check('attach resets unread (no double replay)', shells.read(h1again.id).text === '')
 }
 
+// ---------------------------------------------------------------------------
+// sweep: reaps sessions idle beyond the threshold, keeps fresh ones.
+// ---------------------------------------------------------------------------
+{
+  let sweepHandle
+  const sweepShells = createShellSessions({
+    getSubprocess: () => ({ spawnTerminal: async () => { sweepHandle = fakeHandle(); return sweepHandle } }),
+    sweepMs: 1000,
+  })
+  const s1 = await sweepShells.openLocal({ key: 'sweep-k1' })
+  sweepShells.sweep(Date.now())
+  check('sweep keeps a fresh session', sweepShells.list().length === 1)
+  sweepShells.sweep(Date.now() + 5000)
+  check('sweep reaps an idle session', sweepShells.list().length === 0)
+  // An ended session is not touched by sweep (its handle already closed).
+  const s2 = await sweepShells.openLocal({ key: 'sweep-k2' })
+  sweepHandle.output.emit('close')
+  sweepShells.sweep(Date.now() + 99999)
+  check('sweep leaves ended sessions for close()', sweepShells.list().length === 1 && sweepShells.list()[0].ended === true)
+}
+
 const failed = results.filter((r) => !r)
 console.log(`\n${results.length - failed.length}/${results.length} passed`)
 process.exit(failed.length === 0 ? 0 : 1)

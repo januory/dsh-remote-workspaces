@@ -1056,6 +1056,14 @@ function unwrapRemote(res) {
         React.createElement('div', { style: { flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: 8, padding: '4px 10px', borderBottom: '1px solid ' + borderColor, fontSize: 12, color: '#8b8f98' } },
           React.createElement('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
             status === 'open' ? label + ' · 已连接' : status === 'ended' ? label + ' · 已结束' : status === 'error' ? label + ' · 出错' : '连接中…'),
+          React.createElement('button', {
+            type: 'button',
+            title: '新建 Shell',
+            onClick: function () {
+              try { if (info && info.tab && info.tab.actions) info.tab.actions.openTab(info.tab.kind, { revealIfOpened: false }) } catch (e2) { /* noop */ }
+            },
+            style: { padding: '2px 8px', fontSize: 11.5, cursor: 'pointer', background: 'rgba(127,127,127,0.12)', color: 'inherit', border: '1px solid rgba(127,127,127,0.3)', borderRadius: 4, whiteSpace: 'nowrap' },
+          }, '＋ 新建'),
         ),
         err !== null
           ? React.createElement('div', { style: { flex: '0 0 auto', padding: '6px 10px', color: '#e5484d', fontFamily: 'ui-monospace, monospace', fontSize: 12, whiteSpace: 'pre-wrap' } }, err)

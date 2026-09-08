@@ -23,8 +23,23 @@ import { randomUUID } from 'node:crypto'
 const MAX_UNREAD = 256 * 1024
 const MAX_HISTORY = 512 * 1024
 
-export function createShellSessions({ getSubprocess, openRemote: openRemoteChannel }) {
+export function createShellSessions({ getSubprocess, openRemote: openRemoteChannel, sweepMs = 10 * 60 * 1000 }) {
   const sessions = new Map()
+
+  // Reap sessions no client has read from or written to within `sweepMs`: a
+  // shell whose tab was lost to a refresh (or an archived session) has nobody
+  // left to close it. An on-screen tab polls continuously, so only abandoned
+  // shells — or ones hidden longer than the threshold — are collected.
+  function sweep(now = Date.now()) {
+    for (const [id, session] of [...sessions]) {
+      if (!session.ended && now - session.lastActivityAt > sweepMs) {
+        sessions.delete(id)
+        void session.handle.terminate()
+      }
+    }
+  }
+  const sweepTimer = setInterval(sweep, 60 * 1000)
+  if (typeof sweepTimer.unref === 'function') sweepTimer.unref()
 
   function liveSession(key) {
     if (typeof key !== 'string' || key === '') return undefined
@@ -49,6 +64,7 @@ export function createShellSessions({ getSubprocess, openRemote: openRemoteChann
       unread: { chunks: [], bytes: 0 },
       history: { chunks: [], bytes: 0 },
       ended: false,
+      lastActivityAt: Date.now(),
     }
     handle.output.on('data', (chunk) => {
       const buf = Buffer.from(chunk)
@@ -119,11 +135,13 @@ export function createShellSessions({ getSubprocess, openRemote: openRemoteChann
 
   async function write(id, data) {
     const session = requireSession(id)
+    session.lastActivityAt = Date.now()
     if (!session.ended && typeof data === 'string' && data !== '') await session.handle.write(data)
   }
 
   function read(id) {
     const session = requireSession(id)
+    session.lastActivityAt = Date.now()
     const text = Buffer.concat(session.unread.chunks).toString('utf8')
     session.unread.chunks.length = 0
     session.unread.bytes = 0
@@ -158,5 +176,5 @@ export function createShellSessions({ getSubprocess, openRemote: openRemoteChann
     }))
   }
 
-  return { openLocal, openRemote, write, read, resize, close, list }
+  return { openLocal, openRemote, write, read, resize, close, list, sweep }
 }
