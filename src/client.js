@@ -817,22 +817,23 @@ function unwrapRemote(res) {
     // to it (no reconnect, no "连接中").
     // =========================================================================
     var shellSessionCache = {}
-    var shellKeySeq = 0
-    var shellKeyBySignal = typeof WeakMap !== 'undefined' ? new WeakMap() : null
 
     function ShellBody(props) {
       var getRemote = props.getRemote
       var getCwd = props.getCwd
+      var getSessionId = props.getSessionId
       var useTabInfo = props.useTabInfo
-      return React.createElement(TerminalPane, { getRemote: getRemote, getCwd: getCwd, useTabInfo: useTabInfo })
+      return React.createElement(TerminalPane, { getRemote: getRemote, getCwd: getCwd, getSessionId: getSessionId, useTabInfo: useTabInfo })
     }
 
     function TerminalPane(props) {
       var getRemote = props.getRemote
       var getCwd = props.getCwd
+      var getSessionId = props.getSessionId
       var useTabInfo = props.useTabInfo
       var info = useTabInfo ? useTabInfo() : null
       var tabSignal = info ? info.tab.signal : null
+      var tabId = info && info.tab ? info.tab.id : 'shell'
       var containerRef = React.useRef(null)
       var termRef = React.useRef(null)
       var sessionRef = React.useRef(null)
@@ -891,19 +892,11 @@ function unwrapRemote(res) {
           return undefined
         }
 
-        // Stable per-(session, tab) key, derived once from the occurrence's
-        // abort signal (stable across session switches). A re-mount re-attaches
-        // to the same host session instead of reconnecting.
-        var key
-        if (shellKeyBySignal && tabSignal) {
-          key = shellKeyBySignal.get(tabSignal)
-          if (key === undefined) {
-            key = 'shell-' + (++shellKeySeq) + '-' + Math.random().toString(36).slice(2)
-            shellKeyBySignal.set(tabSignal, key)
-          }
-        } else {
-          key = 'shell-' + (++shellKeySeq) + '-' + Math.random().toString(36).slice(2)
-        }
+        // Stable per-(session, tab) key derived from the session id + the dock
+        // tab id. Both survive a page refresh (the session is resumed and the
+        // layout restores the tab id), so a re-mount — or a re-load — re-attaches
+        // to the same host session instead of reconnecting or leaking a new one.
+        var key = (getSessionId ? getSessionId() : 's') + ':' + tabId
 
         var opened = false
         var ro = null
@@ -1163,6 +1156,14 @@ function unwrapRemote(res) {
           return row ? row.cwd : undefined
         } catch (e) { return undefined }
       }
+      var getSessionId = function () {
+        try {
+          var sessions = ctx.sessions
+          if (!sessions || !sessions.list || typeof sessions.list.getSnapshot !== 'function') return undefined
+          var snap = sessions.list.getSnapshot()
+          return snap && snap.current ? String(snap.current) : undefined
+        } catch (e) { return undefined }
+      }
 
       // Settings section: machines + open remote workspaces (grouped by host).
       ctx.slots.inject('settings.section', function () {
@@ -1196,7 +1197,7 @@ function unwrapRemote(res) {
       })
       ctx.slots.inject('sidebar.right.pane.tab', function () {
         return ctx.slots.register(
-          { name: 'sidebar.right.pane.tab', key: SHELL_ID, inject: function () { return { getRemote: getRemote, getCwd: getCwd } } },
+          { name: 'sidebar.right.pane.tab', key: SHELL_ID, inject: function () { return { getRemote: getRemote, getCwd: getCwd, getSessionId: getSessionId } } },
           ShellBody,
         )
       })
