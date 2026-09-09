@@ -1,4 +1,5 @@
 import { Client } from 'ssh2'
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join as joinPath } from 'node:path'
@@ -272,7 +273,7 @@ export function clientForHost(alias, configPath = defaultSshConfigPath()) {
   return host ? new SshClient(host) : new SshClient({ alias })
 }
 
-/** Human-readable summary of an ssh2 connection/auth error. */
+/** Human-readable summary of an ssh2 connection/auth error (USER-facing). */
 function describeError(error) {
   const message = error && error.message ? error.message : String(error)
   if (/all configured authentication methods failed/i.test(message)) {
@@ -292,6 +293,114 @@ function describeError(error) {
   if (/ENOTFOUND|getaddrinfo/i.test(message)) return '无法解析主机地址'
   if (/key exchange failed/i.test(message)) return '密钥交换失败（服务器可能不支持所选算法）'
   return message
+}
+
+/**
+ * English counterpart of {@link describeError} for the messages the MODEL
+ * reads. `execShell()` errors surface to the agent (the remote shell tool
+ * result and the remote-`rg` tool error) and agent-facing text is English;
+ * the Chinese set above stays on the paths a USER sees (the settings "test
+ * connection" card, the Shell tab).
+ */
+function describeErrorEn(error) {
+  const message = error && error.message ? error.message : String(error)
+  if (/all configured authentication methods failed/i.test(message)) {
+    return 'authentication failed: key/passphrase rejected or the server does not authorize this key'
+  }
+  if (/no suitable authentication methods/i.test(message)) {
+    return 'the server accepts no supported authentication method'
+  }
+  if (/cannot parse privatekey/i.test(message)) {
+    return `could not parse the private key (wrong passphrase or unsupported format): ${message}`
+  }
+  if (/encrypted private keys?|passphrase/i.test(message) && /incorrect/i.test(message)) {
+    return `wrong private-key passphrase: ${message}`
+  }
+  if (/ECONNREFUSED|connect refused/i.test(message)) return 'connection refused (host or port unreachable)'
+  if (/ETIMEDOUT|timeout/i.test(message)) return 'connection timed out'
+  if (/ENOTFOUND|getaddrinfo/i.test(message)) return 'cannot resolve the host address'
+  if (/key exchange failed/i.test(message)) return 'key exchange failed (the server may not support the offered algorithms)'
+  return message
+}
+
+// ---------------------------------------------------------------------------
+// Short-lived exec connection pool
+// ---------------------------------------------------------------------------
+// `run()`/`execShell()` used to open a brand-new ssh2 session (TCP connect +
+// key exchange + authentication) for EVERY command. Parallel tool calls — a
+// few grep/glob/file/shell ops in one step, or two sessions hitting the same
+// host — therefore burst dozens of simultaneous handshakes at the remote
+// sshd, which dropped connections under the load (`Connection lost before
+// handshake`, `read ECONNRESET`). The pool bounds that handshake load to a
+// few persistent connections per target; `exec` channels multiplex over
+// them, so after warm-up a command costs no connection setup at all.
+// Connections are evicted when they error or close, closed after being idle
+// for `EXEC_POOL_IDLE_MS`, and a connection that carried an aborted
+// (timed-out) command is drained then torn down so the remote session really
+// ends (closing the exec channel alone does not reliably reap a Windows
+// remote process tree).
+const EXEC_POOL_MAX_CONNS = 3
+const EXEC_POOL_IDLE_MS = 120_000
+const EXEC_POOL_SWEEP_MS = 30_000
+const EXEC_KEEPALIVE_MS = 15_000
+const RETRY_DELAY_MS = 200
+/** Open another pooled connection once current ones host at least this many channels. */
+const CHANNELS_PER_CONN_SPREAD_AT = 3
+
+const execPools = new Map()
+let poolSweeper = null
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function evictPoolEntry(pool, entry) {
+  const index = pool.conns.indexOf(entry)
+  if (index >= 0) pool.conns.splice(index, 1)
+  if (!entry.connEnded) {
+    entry.connEnded = true
+    try { entry.conn.end() } catch {}
+  }
+}
+
+function sweepExecPools() {
+  const now = Date.now()
+  for (const pool of execPools.values()) {
+    for (const entry of [...pool.conns]) {
+      if (entry.open > 0) continue
+      const idleTooLong = entry.alive && !entry.wantsDead && entry.idleSince > 0 && now - entry.idleSince >= EXEC_POOL_IDLE_MS
+      if (idleTooLong || entry.wantsDead || !entry.alive) evictPoolEntry(pool, entry)
+    }
+  }
+}
+
+function ensurePoolSweeper() {
+  if (poolSweeper === null) {
+    poolSweeper = setInterval(sweepExecPools, EXEC_POOL_SWEEP_MS)
+    if (typeof poolSweeper.unref === 'function') poolSweeper.unref()
+  }
+}
+
+/** Connect an ssh2 Client and resolve once it is authenticated ('ready'). */
+function connectClient(conn, config) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const done = (error) => {
+      if (settled) return
+      settled = true
+      conn.removeListener('error', onError)
+      if (error === undefined) resolve()
+      else reject(error instanceof Error ? error : new Error(String(error)))
+    }
+    const onError = (error) => done(error)
+    conn.once('ready', () => done())
+    conn.on('error', onError)
+    try {
+      conn.connect(config)
+    } catch (error) {
+      done(error)
+    }
+  })
 }
 
 /**
@@ -351,42 +460,40 @@ export class SshClient {
    * `{ ok, ms, exitCode, stdout, stderr, error }` shape the system-ssh
    * transport produced, so every higher-level method is unchanged.
    */
+  /**
+   * Run one remote command and capture its stdout/stderr. Returns the same
+   * `{ ok, ms, exitCode, stdout, stderr, error }` shape the system-ssh
+   * transport produced, so every higher-level method is unchanged.
+   *
+   * The command runs over a SHORT-LIVED pooled connection (see the exec pool
+   * above): at most `EXEC_POOL_MAX_CONNS` SSH sessions are ever open per
+   * target, so bursty parallel tool calls no longer present the remote sshd
+   * with a fresh handshake per command. A failure that happened before the
+   * command was sent (nothing ran remotely) retries once.
+   */
   async run(command, { input, timeoutMs } = {}) {
     const started = Date.now()
     const deadline = timeoutMs ?? this.timeoutMs
-    return await new Promise((resolve) => {
-      const conn = new Client()
-      let settled = false
-      let timer
-      const settle = (result) => {
-        if (settled) return
-        settled = true
-        if (timer !== undefined) clearTimeout(timer)
-        try { conn.end() } catch {}
-        resolve({ ...result, ms: Date.now() - started })
-      }
-      timer = setTimeout(() => settle({ ok: false, error: 'SSH 命令执行超时' }), deadline)
-
-      conn.on('ready', () => {
-        conn.exec(command, (err, stream) => {
-          if (err) { settle({ ok: false, error: err.message }); return }
-          let stdout = ''
-          let stderr = ''
-          stream.on('data', (data) => { stdout += data })
-          stream.stderr.on('data', (data) => { stderr += data })
-          stream.on('close', (code) => { settle({ ok: code === 0, exitCode: code, stdout, stderr }) })
-          if (input === undefined) stream.end()
-          else stream.end(String(input))
-        })
-      })
-      conn.on('error', (error) => { settle({ ok: false, error: describeError(error) }) })
-
+    for (let attempt = 0; ; attempt++) {
+      let lease
       try {
-        conn.connect(this.connectConfig())
+        lease = await this._acquireExec()
       } catch (error) {
-        settle({ ok: false, error: describeError(error) })
+        if (attempt === 0) { await sleepMs(RETRY_DELAY_MS); continue }
+        return { ok: false, ms: Date.now() - started, error: describeError(error) }
       }
-    })
+      const outcome = await this._execOnLease(lease, {
+        command,
+        input,
+        deadline: Math.max(0, deadline - (Date.now() - started)),
+      })
+      lease.release(outcome.healthy)
+      if (!outcome.ok && attempt === 0 && outcome.presend) {
+        await sleepMs(RETRY_DELAY_MS)
+        continue
+      }
+      return { ...outcome.result, ms: Date.now() - started }
+    }
   }
 
   async exec(command, opts) {
@@ -410,38 +517,251 @@ export class SshClient {
       return { ok: false, error: PROBE_UNKNOWN_MSG }
     }
     const script = buildExecScript(profile, command, cwd)
-    return await new Promise((resolve) => {
-      const conn = new Client()
+    const started = Date.now()
+    for (let attempt = 0; ; attempt++) {
+      let lease
+      try {
+        lease = await this._acquireExec()
+      } catch (error) {
+        if (attempt === 0) { await sleepMs(RETRY_DELAY_MS); continue }
+        return { ok: false, error: describeErrorEn(error) }
+      }
+      const outcome = await this._execShellOnLease(lease, {
+        script,
+        profile,
+        stdin,
+        signal,
+        deadline: Math.max(0, timeoutMs - (Date.now() - started)),
+        stdoutMaxBytes,
+        stderrMaxBytes,
+      })
+      lease.release(outcome.healthy)
+      if (!outcome.ok && attempt === 0 && outcome.presend) {
+        await sleepMs(RETRY_DELAY_MS)
+        continue
+      }
+      return outcome.result
+    }
+  }
+
+  /**
+   * Pool identity: target plus a credentials fingerprint (never logged).
+   * Distinct credential sets for the same host:user:port stay in separate
+   * pools so one machine's authenticated session is never reused by another.
+   */
+  _execPoolKey() {
+    const base = `${this.user ?? ''}@${this.host}:${Number(this.port) || 22}`
+    const creds = `${this.identityFile ?? ''}\n${this.password ?? ''}\n${this.passphrase ?? ''}`
+    return `${base}#${createHash('sha1').update(creds).digest('hex').slice(0, 12)}`
+  }
+
+  /**
+   * Take one pooled exec connection, opening a new ssh2 session only when the
+   * pool is below its cap and the live connections are already spreading
+   * several channels. Every acquire must be paired with exactly one
+   * `lease.release()`.
+   */
+  async _acquireExec() {
+    const key = this._execPoolKey()
+    let pool = execPools.get(key)
+    if (pool === undefined) {
+      pool = { conns: [], creating: 0 }
+      execPools.set(key, pool)
+      ensurePoolSweeper()
+    }
+    for (;;) {
+      const ready = pool.conns.filter((e) => e.state === 'ready' && e.alive && !e.wantsDead)
+      if (ready.length > 0) {
+        const best = ready.slice().sort((a, b) => a.open - b.open)[0]
+        // Reuse when the pool is at its cap or this connection is still light;
+        // otherwise fall through to open one more (bounded by the cap).
+        if (pool.conns.length >= EXEC_POOL_MAX_CONNS || best.open < CHANNELS_PER_CONN_SPREAD_AT) {
+          best.open += 1
+          best.idleSince = 0
+          return this._leaseFor(best, false)
+        }
+      }
+      if (pool.conns.length + pool.creating < EXEC_POOL_MAX_CONNS) {
+        pool.creating += 1
+        try {
+          const entry = await this._createPooledEntry(pool)
+          entry.open += 1
+          entry.idleSince = 0
+          return this._leaseFor(entry, true)
+        } finally {
+          pool.creating -= 1
+        }
+      }
+      // Pool saturated and no ready connection yet (the in-flight one is still
+      // handshaking or all live connections are drained/dying): wait and
+      // re-check instead of opening another handshake beyond the cap.
+      await sleepMs(20)
+    }
+  }
+
+  /**
+   * Push a NEW entry onto the pool and connect it. The entry only becomes
+   * reusable once it is authenticated ('ready'): concurrent acquires must
+   * never hand an exec to a connection that is still in the handshake phase
+   * (that corrupts the protocol stream and re-bursts the sshd).
+   */
+  async _createPooledEntry(pool) {
+    const entry = {
+      conn: new Client(), pool, state: 'connecting', alive: true, open: 0,
+      idleSince: 0, wantsDead: false, connEnded: false,
+    }
+    pool.conns.push(entry)
+    const config = { ...this.connectConfig(), keepaliveInterval: EXEC_KEEPALIVE_MS, keepaliveCountMax: 3 }
+    entry.conn.on('error', () => evictPoolEntry(pool, entry))
+    entry.conn.on('close', () => evictPoolEntry(pool, entry))
+    try {
+      await connectClient(entry.conn, config)
+      entry.state = 'ready'
+      return entry
+    } catch (error) {
+      evictPoolEntry(pool, entry)
+      throw error
+    }
+  }
+
+  _leaseFor(entry, fresh) {
+    const lease = {
+      conn: entry.conn,
+      fresh,
+      release(healthy) {
+        entry.open = Math.max(0, entry.open - 1)
+        if (healthy === false || !entry.alive) {
+          entry.alive = false
+          if (entry.open === 0) evictPoolEntry(entry.pool, entry)
+          return
+        }
+        if (entry.open === 0 && !entry.wantsDead) entry.idleSince = Date.now()
+      },
+      teardown() {
+        // Aborted op: end the whole connection once no other channel uses it
+        // (closing the exec channel alone does not reliably reap the remote).
+        entry.wantsDead = true
+        if (entry.open <= 1) evictPoolEntry(entry.pool, entry)
+      },
+    }
+    return lease
+  }
+
+  /**
+   * Run one `exec` over an already-connected pooled lease. Resolves with
+   * `{ ok, presend, healthy, result }`: `healthy` says whether the
+   * underlying connection may stay pooled, `presend` is true when the
+   * failure happened before the command reached the server (safe to retry).
+   */
+  _execOnLease(lease, { command, input, deadline }) {
+    return new Promise((resolve) => {
+      const conn = lease.conn
       let settled = false
-      let timedOut = false
       let timer
-      let stream
-      const finish = (result) => {
+      let stream = null
+      const finish = (result, { healthy = true, presend = false } = {}) => {
         if (settled) return
         settled = true
         if (timer !== undefined) clearTimeout(timer)
-        try { conn.end() } catch {}
-        resolve(result)
+        conn.removeListener('error', onConnError)
+        resolve({ ok: result.ok, presend, healthy, result })
       }
-      const killRemote = () => {
-        try { if (stream) stream.close() } catch {}
-        try { conn.end() } catch {}
+      const onConnError = (error) => {
+        finish({ ok: false, error: describeError(error) }, { healthy: false, presend: stream === null })
       }
-      timer = setTimeout(() => { timedOut = true; killRemote() }, timeoutMs)
+      conn.on('error', onConnError)
+      timer = setTimeout(() => {
+        finish({ ok: false, error: 'SSH 命令执行超时' }, { healthy: false, presend: false })
+        // Drain-teardown: end the connection once this op is the only user.
+        lease.teardown()
+      }, Math.max(0, deadline))
+      try {
+        conn.exec(command, (err, s) => {
+          if (settled) return
+          if (err) {
+            // exec failed before a channel existed -> the command never ran.
+            finish({ ok: false, error: describeError(err) }, { healthy: false, presend: true })
+            return
+          }
+          stream = s
+          let stdout = ''
+          let stderr = ''
+          s.on('data', (data) => { stdout += data })
+          s.stderr.on('data', (data) => { stderr += data })
+          s.on('close', (code) => {
+            finish({ ok: code === 0, exitCode: code, stdout, stderr }, { healthy: true })
+          })
+          if (input === undefined) s.end()
+          else s.end(String(input))
+        })
+      } catch (error) {
+        finish({ ok: false, error: describeError(error) }, { healthy: false, presend: true })
+      }
+    })
+  }
+
+  /**
+   * execShell half over one pooled lease (bounded output, exit status, abort
+   * and timeout with drain-teardown). Mirrors the standalone semantics.
+   */
+  _execShellOnLease(lease, { script, profile, stdin, signal, deadline, stdoutMaxBytes, stderrMaxBytes }) {
+    return new Promise((resolve) => {
+      const conn = lease.conn
+      let settled = false
+      let timedOut = false
+      let aborting = false
+      let timer
+      let stream = null
+      const finish = (result, { healthy = true, presend = false } = {}) => {
+        if (settled) return
+        settled = true
+        if (timer !== undefined) clearTimeout(timer)
+        if (signal !== undefined) signal.removeEventListener('abort', onAbort)
+        conn.removeListener('error', onConnError)
+        resolve({ ok: result.ok, presend, healthy, result })
+      }
+      const onConnError = (error) => {
+        finish({ ok: false, error: describeErrorEn(error) }, { healthy: false, presend: stream === null })
+      }
+      const onAbort = () => {
+        aborting = true
+        try { if (stream !== null) stream.close() } catch {}
+        lease.teardown()
+      }
+      conn.on('error', onConnError)
       if (signal !== undefined) {
-        if (signal.aborted) killRemote()
-        else signal.addEventListener('abort', killRemote, { once: true })
+        if (signal.aborted) onAbort()
+        else signal.addEventListener('abort', onAbort, { once: true })
       }
-      conn.on('ready', () => {
+      timer = setTimeout(() => {
+        timedOut = true
+        try { if (stream !== null) stream.close() } catch {}
+        finish({
+          ok: true,
+          exitCode: null,
+          signal: null,
+          timedOut: true,
+          aborted: false,
+          stdout: { text: '', truncated: false },
+          stderr: { text: '', truncated: false },
+        }, { healthy: false })
+        // Drain-teardown: end the connection once this op is the only user.
+        lease.teardown()
+      }, Math.max(0, deadline))
+      try {
         conn.exec(script, (err, s) => {
-          if (err) { finish({ ok: false, error: err.message }); return }
+          if (settled) return
+          if (err) {
+            // exec failed before a channel existed -> the command never ran.
+            finish({ ok: false, error: describeErrorEn(err) }, { healthy: false, presend: true })
+            return
+          }
           stream = s
           const out = new CapCollector(stdoutMaxBytes)
           const errc = new CapCollector(stderrMaxBytes)
           s.on('data', (d) => out.push(d))
           s.stderr.on('data', (d) => errc.push(d))
           s.on('close', (code) => {
-            const aborted = signal !== undefined && signal.aborted
             const stdout = out.output()
             const stderr = errc.output()
             if (profile.family === 'windows') {
@@ -452,18 +772,18 @@ export class SshClient {
               ok: true,
               exitCode: code,
               signal: null,
-              timedOut: timedOut && !aborted,
-              aborted: aborted && !timedOut,
+              timedOut: timedOut && !aborting,
+              aborted: aborting && !timedOut,
               stdout,
               stderr,
-            })
+            }, { healthy: !aborting })
           })
           if (stdin === undefined) s.end()
           else s.end(String(stdin))
         })
-      })
-      conn.on('error', (error) => finish({ ok: false, error: describeError(error) }))
-      try { conn.connect(this.connectConfig()) } catch (error) { finish({ ok: false, error: describeError(error) }) }
+      } catch (error) {
+        finish({ ok: false, error: describeErrorEn(error) }, { healthy: false, presend: true })
+      }
     })
   }
 
@@ -490,9 +810,10 @@ export class SshClient {
           const call = (method) => (...args) => new Promise((res, rej) => {
             sftp[method](...args, (e, out) => { if (e) rej(e); else res(out) })
           })
-          resolve({
+          const facade = {
             conn,
             raw: sftp,
+            alive: true,
             readdir: call('readdir'),
             stat: call('stat'),
             readFile: call('readFile'),
@@ -504,8 +825,15 @@ export class SshClient {
             rename: call('rename'),
             rmdir: call('rmdir'),
             realpath: call('realpath'),
-            end: () => { try { conn.end() } catch {} },
-          })
+            end: () => { facade.alive = false; try { conn.end() } catch {} },
+          }
+          // A dedicated SFTP connection lives as long as its holder needs it
+          // (RoutingFileSystem keeps one per target). When the server drops or
+          // resets it, flag the facade dead so holders reopen instead of
+          // failing every later operation on a stale channel.
+          conn.on('error', () => { facade.alive = false })
+          conn.on('close', () => { facade.alive = false })
+          resolve(facade)
         })
       })
       conn.on('error', (err) => { clearTimeout(timer); fail(err) })

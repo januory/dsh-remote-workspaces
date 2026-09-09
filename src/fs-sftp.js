@@ -34,12 +34,29 @@ export class SftpBackend {
   constructor(client) {
     this.client = client
     this._sftp = undefined
+    this._opening = undefined
   }
 
-  /** Lazily open ONE persistent SFTP channel per backend (host). */
+  /**
+   * Lazily open ONE persistent SFTP channel per backend (host). When the
+   * underlying ssh2 connection dies (server drop/reset mid-life — the facade
+   * flips `alive` to false on conn error/close), the stale channel is dropped
+   * and reopened once, so a single network hiccup no longer poisons every
+   * later file operation until the process restarts. Concurrent callers share
+   * the in-flight reopen.
+   */
   async sftp() {
-    if (this._sftp === undefined) this._sftp = await this.client.sftp()
-    return this._sftp
+    if (this._sftp !== undefined && this._sftp.alive !== false) return this._sftp
+    if (this._sftp !== undefined) {
+      try { this._sftp.end() } catch {}
+      this._sftp = undefined
+    }
+    if (this._opening === undefined) {
+      this._opening = this.client.sftp()
+        .then((facade) => { this._sftp = facade; return facade })
+        .finally(() => { this._opening = undefined })
+    }
+    return this._opening
   }
 
   async resolve(path, opts = {}) {
