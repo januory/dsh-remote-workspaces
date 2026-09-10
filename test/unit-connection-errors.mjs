@@ -42,6 +42,10 @@ async function closedPort() {
   const en = await rejection(() => client.sftp({ agentFacing: true }))
   check('agent-facing SFTP failure is English with target + stage', /^SFTP connection failed \(target: tester@127\.0\.0\.1:\d+, stage: connect\)/.test(String(en?.message)), String(en?.message))
   check('the refused-connect cause is preserved', /ECONNREFUSED/i.test(String(en?.message)), String(en?.message))
+  // The harness's project-root marker walk rethrows anything that is not
+  // FS_NOT_FOUND, which used to abort the whole turn on an unreachable remote.
+  check('the channel-open failure is tagged FS_NOT_FOUND for provider probes', en?.code === 'FS_NOT_FOUND', String(en?.code))
+  check('the original error is kept as the cause', en?.cause !== undefined, String(en?.cause))
   const zh = await rejection(() => client.sftp())
   check('user-facing SFTP failure stays Chinese with target + stage', /^SFTP 连接失败（目标：tester@127\.0\.0\.1:\d+，阶段：连接）/.test(String(zh?.message)), String(zh?.message))
 }

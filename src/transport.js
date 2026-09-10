@@ -906,7 +906,16 @@ export class SshClient {
           target: this._targetLabel(),
           cause: timedOut ? undefined : cause,
         }))
-        if (error !== undefined && error !== null && error.code !== undefined) wrapped.code = error.code
+        // The harness's project-root marker walk (agent-instructions →
+        // findProjectRoot → existsAsMarker) tolerates ONLY `FS_NOT_FOUND` from a
+        // provider probe and rethrows everything else, which aborts the WHOLE
+        // turn — even though the failing probe only asks "is there an AGENTS.md
+        // / .git marker in here?". Tag the channel-open failure with that code
+        // so prompt assembly degrades to "no instructions" instead of killing
+        // the turn; the MESSAGE stays truthful, so the model still learns the
+        // remote could not be reached (and `cause` keeps the original error).
+        wrapped.code = 'FS_NOT_FOUND'
+        if (error !== undefined && error !== null) wrapped.cause = error
         reject(wrapped)
       }
       const timer = setTimeout(() => { timedOut = true; fail(new Error('timeout')) }, this.readyTimeoutMs)
