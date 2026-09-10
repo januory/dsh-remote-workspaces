@@ -84,13 +84,13 @@ async function closedPort() {
   check('SftpBackend requests the agent-facing (English) message', seen?.agentFacing === true, JSON.stringify(seen))
 }
 
-// --- 5. the exec path tags the target for the agent only --------------------
+// --- 5. exec connect failures use the same unified form for each audience ----
 {
   const client = new SshClient({ host: '127.0.0.1', port: await closedPort(), user: 'tester' })
   const en = await client.run('echo ok', { agentFacing: true, timeoutMs: 4000 })
-  check('agent-facing exec failure carries the target', /\(target: tester@127\.0\.0\.1:\d+\)$/.test(String(en.error)), String(en.error))
+  check('agent-facing exec failure is the unified English form with stage', /^SSH connection failed \(target: tester@127\.0\.0\.1:\d+, stage: connect\)/.test(String(en.error)), String(en.error))
   const zh = await client.run('echo ok', { timeoutMs: 4000 })
-  check('user-facing exec failure stays Chinese and untagged', /连接被拒绝|连接超时/.test(String(zh.error)) && !/\(target:/.test(String(zh.error)), String(zh.error))
+  check('user-facing exec failure stays Chinese with target + stage', /^SSH 连接失败（目标：tester@127\.0\.0\.1:\d+，阶段：连接）/.test(String(zh.error)), String(zh.error))
 }
 
 const failed = results.filter((r) => !r.ok)

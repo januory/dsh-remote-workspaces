@@ -348,6 +348,26 @@ function channelOpenMessage({ what, agentFacing, timedOut, stage, target, cause 
 }
 
 /**
+ * A remote connection open that failed, carrying the parts each audience needs
+ * to re-render (agent English / user Chinese) instead of one baked-in string.
+ * The rendered `message` is the agent-facing (English) form; call sites that
+ * serve the USER re-render through {@link connectionOpenMessageFor}.
+ */
+function connectionOpenFailure({ what, stage, timedOut, target, cause }) {
+  const parts = { what, stage, timedOut, target, cause }
+  const error = new Error(channelOpenMessage({ ...parts, agentFacing: true }))
+  error.connectionOpen = parts
+  return error
+}
+
+/** Re-render a {@link connectionOpenFailure} for one audience, or undefined. */
+function connectionOpenMessageFor(error, agentFacing) {
+  const parts = error !== null && typeof error === 'object' ? error.connectionOpen : undefined
+  if (parts === undefined) return undefined
+  return channelOpenMessage({ ...parts, agentFacing })
+}
+
+/**
  * Signatures of a command that failed because the SCRIPT DIALECT did not match
  * the host — i.e. the cached remote profile went stale because the host's
  * default shell changed (or sshd was reconfigured) under a long-lived DSH
@@ -439,7 +459,7 @@ function ensurePoolSweeper() {
 }
 
 /** Connect an ssh2 Client and resolve once it is authenticated ('ready'). */
-function connectClient(conn, config) {
+function connectClient(conn, config, onTcpConnect) {
   return new Promise((resolve, reject) => {
     let settled = false
     const done = (error) => {
@@ -450,6 +470,7 @@ function connectClient(conn, config) {
       else reject(error instanceof Error ? error : new Error(String(error)))
     }
     const onError = (error) => done(error)
+    if (typeof onTcpConnect === 'function') conn.once('connect', () => { onTcpConnect() })
     conn.once('ready', () => done())
     conn.on('error', onError)
     try {
@@ -500,10 +521,26 @@ export class SshClient {
   /**
    * Agent-facing (English) connection-error text, tagged with the target — the
    * model triages from this, and a bare "connection timed out" never said
-   * WHICH host or WHICH stage died.
+   * WHICH host or WHICH stage died. A structured connect failure (see
+   * {@link connectionOpenFailure}) is rendered with its real stage instead.
    */
   _agentError(error) {
+    const contextual = connectionOpenMessageFor(error, true)
+    if (contextual !== undefined) return contextual
     return `${describeErrorEn(error)} (target: ${this._targetLabel()})`
+  }
+
+  /** Structured failure for a pooled connection that could not be opened. */
+  _connectionOpenFailure(error, tcpConnected) {
+    const message = error instanceof Error ? error.message : String(error)
+    const timedOut = /timed out|timeout/i.test(message)
+    return connectionOpenFailure({
+      what: 'SSH',
+      stage: tcpConnected ? 'handshake' : 'connect',
+      timedOut,
+      target: this._targetLabel(),
+      cause: timedOut ? undefined : message,
+    })
   }
 
   connectConfig() {
@@ -550,8 +587,12 @@ export class SshClient {
     const started = Date.now()
     const deadline = timeoutMs ?? this.timeoutMs
     const describe = agentFacing ? describeErrorEn : describeError
-    // The agent-facing wording carries the target too (see `_agentError`).
+    // The agent-facing wording carries the target too (see `_agentError`); a
+    // structured connect failure is rendered with its real stage for either
+    // audience.
     const describeFor = (error) => {
+      const contextual = connectionOpenMessageFor(error, agentFacing)
+      if (contextual !== undefined) return contextual
       const text = describe(error)
       return agentFacing ? `${text} (target: ${this._targetLabel()})` : text
     }
@@ -605,7 +646,15 @@ export class SshClient {
     if (profile.family === 'unknown') {
       return { ok: false, error: PROBE_UNKNOWN_MSG }
     }
-    const script = buildExecScript(profile, command, cwd)
+    const windows = profile.family === 'windows'
+    // A pooled connection can never be ended to reap a timed-out command (it
+    // carries sibling channels), and closing a Windows exec channel does NOT
+    // reap the remote process tree (verified). So the script self-reports its
+    // PID — the same trick as execStream — and a timeout/abort taskkills that
+    // tree before the channel is closed. The marker line is stripped from
+    // stdout, so callers see exactly the command's own output.
+    const markerCommand = windows ? "Write-Output ('DWSH_PID=' + $PID)\n" + command : command
+    const script = buildExecScript(profile, markerCommand, cwd)
     const started = Date.now()
     for (let attempt = 0; ; attempt++) {
       let lease
@@ -623,6 +672,7 @@ export class SshClient {
         deadline: Math.max(0, timeoutMs - (Date.now() - started)),
         stdoutMaxBytes,
         stderrMaxBytes,
+        pidMarker: windows,
       })
       lease.release(outcome.healthy)
       if (!outcome.ok) {
@@ -710,13 +760,14 @@ export class SshClient {
     const config = { ...this.connectConfig(), keepaliveInterval: EXEC_KEEPALIVE_MS, keepaliveCountMax: 3 }
     entry.conn.on('error', () => evictPoolEntry(pool, entry))
     entry.conn.on('close', () => evictPoolEntry(pool, entry))
+    let tcpConnected = false
     try {
-      await connectClient(entry.conn, config)
+      await connectClient(entry.conn, config, () => { tcpConnected = true })
       entry.state = 'ready'
       return entry
     } catch (error) {
       evictPoolEntry(pool, entry)
-      throw error
+      throw this._connectionOpenFailure(error, tcpConnected)
     }
   }
 
@@ -800,7 +851,7 @@ export class SshClient {
    * execShell half over one pooled lease (bounded output, exit status, abort
    * and timeout with drain-teardown). Mirrors the standalone semantics.
    */
-  _execShellOnLease(lease, { script, profile, stdin, signal, deadline, stdoutMaxBytes, stderrMaxBytes }) {
+  _execShellOnLease(lease, { script, profile, stdin, signal, deadline, stdoutMaxBytes, stderrMaxBytes, pidMarker = false }) {
     return new Promise((resolve) => {
       const conn = lease.conn
       let settled = false
@@ -808,10 +859,30 @@ export class SshClient {
       let aborting = false
       let timer
       let stream = null
+      // The Windows PID marker (see execShell) is the script's FIRST stdout
+      // line, which may arrive split across chunks; parse it out of a small head
+      // buffer so a timeout can `taskkill /T` the exact remote tree.
+      let pidResolve
+      const pid = new Promise((res) => { pidResolve = res })
+      if (!pidMarker) pidResolve(null)
+      const pidTimer = setTimeout(() => pidResolve(null), 8000)
+      // Reap the remote tree by PID. Closing the channel alone leaves a Windows
+      // command (and its children) running; the pooled connection must stay up
+      // because sibling channels may share it.
+      const reapRemoteTree = () => {
+        if (!pidMarker) return
+        pid.then((remotePid) => {
+          if (typeof remotePid !== 'number' || remotePid <= 0) return
+          void this.execShell(`taskkill /PID ${remotePid} /T /F`, {
+            timeoutMs: 15000, stdoutMaxBytes: 4096, stderrMaxBytes: 4096,
+          }).catch(() => {})
+        })
+      }
       const finish = (result, { healthy = true, presend = false } = {}) => {
         if (settled) return
         settled = true
         if (timer !== undefined) clearTimeout(timer)
+        clearTimeout(pidTimer)
         if (signal !== undefined) signal.removeEventListener('abort', onAbort)
         conn.removeListener('error', onConnError)
         resolve({ ok: result.ok, presend, healthy, result })
@@ -821,6 +892,7 @@ export class SshClient {
       }
       const onAbort = () => {
         aborting = true
+        reapRemoteTree()
         try { if (stream !== null) stream.close() } catch {}
         lease.teardown()
       }
@@ -831,6 +903,7 @@ export class SshClient {
       }
       timer = setTimeout(() => {
         timedOut = true
+        reapRemoteTree()
         try { if (stream !== null) stream.close() } catch {}
         finish({
           ok: true,
@@ -855,9 +928,34 @@ export class SshClient {
           stream = s
           const out = new CapCollector(stdoutMaxBytes)
           const errc = new CapCollector(stderrMaxBytes)
-          s.on('data', (d) => out.push(d))
+          let head = ''
+          let markerResolved = !pidMarker
+          const onOut = (d) => {
+            if (markerResolved) { out.push(d); return }
+            head += String(d)
+            const m = /^DWSH_PID=(\d+)\r?\n/.exec(head)
+            if (m !== null) {
+              markerResolved = true
+              clearTimeout(pidTimer)
+              pidResolve(Number(m[1]))
+              const rest = head.slice(m[0].length)
+              head = ''
+              if (rest.length > 0) out.push(rest)
+              return
+            }
+            if (head.length > 4096) {
+              // Something else produced output first; give up on the marker.
+              markerResolved = true
+              clearTimeout(pidTimer)
+              pidResolve(null)
+              out.push(head)
+              head = ''
+            }
+          }
+          s.on('data', onOut)
           s.stderr.on('data', (d) => errc.push(d))
           s.on('close', (code) => {
+            if (!markerResolved && head !== '') out.push(head)
             const stdout = out.output()
             const stderr = errc.output()
             if (profile.family === 'windows') {

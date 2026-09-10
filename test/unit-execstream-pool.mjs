@@ -81,6 +81,7 @@ const server = new Server({ hostKeys: [privateKey] }, (client) => {
             setTimeout(() => { try { client.end() } catch {} }, 20)
             return
           }
+          if (cmd.includes('SHELL_HOLD')) { stream.write('held-shell\r\n'); heldStreams.push(stream); return }
           const hold = /HOLD_OPEN-(\w+)/.exec(cmd)
           if (hold !== null) {
             stream.write(`held-${hold[1]}\r\n`)
@@ -124,6 +125,7 @@ check('the reconnect opened exactly one fresh connection', accepted === 2 && liv
 const shells = await Promise.all(Array.from({ length: 6 }, () => client.execShell('echo ok', { timeoutMs: 10000 })))
 check('6 parallel execShell calls all succeed', shells.every((r) => r.ok && r.exitCode === 0), JSON.stringify(shells.map((r) => r.exitCode)))
 check('6 parallel execShell calls stay within the pool cap', accepted <= 3, `accepted=${accepted}`)
+check('the Windows PID marker is stripped from execShell stdout', shells.every((r) => !String(r.stdout?.text ?? '').includes('DWSH_PID')), JSON.stringify(shells.map((r) => r.stdout?.text)))
 
 // --- 5. background jobs multiplex over the pool ------------------------------
 const jobs = await Promise.all(Array.from({ length: 6 }, (_, i) => client.execStream(`echo JOB-${i}`)))
@@ -176,8 +178,18 @@ check('that later job needed no new connection', accepted === acceptedBeforeKill
   const offline = new SshClient({ host: '127.0.0.1', port: deadPort, user: 'tester' })
   const en = await offline.run('echo ok', { agentFacing: true, timeoutMs: 4000 })
   const zh = await offline.run('echo ok', { timeoutMs: 4000 })
-  check('agentFacing: true yields an ENGLISH connection error', /connection refused|connection timed out/.test(en.error ?? ''), String(en.error))
-  check('the default (USER-facing) error stays Chinese', /连接被拒绝|连接超时|无法解析主机地址/.test(zh.error ?? ''), String(zh.error))
+  check('agentFacing: true yields the unified ENGLISH connect failure with stage', /^SSH connection failed \(target: tester@127\.0\.0\.1:\d+, stage: connect\): .*ECONNREFUSED/.test(String(en.error)), String(en.error))
+  check('the default (USER-facing) error stays Chinese with target + stage', /^SSH 连接失败（目标：tester@127\.0\.0\.1:\d+，阶段：连接）/.test(String(zh.error)), String(zh.error))
+}
+
+// --- 8. a timed-out foreground command is reaped by PID ---------------------
+{
+  const before = taskkillSeen
+  const timed = await client.execShell('echo SHELL_HOLD', { cwd: '/C:/Windows/Temp', timeoutMs: 700 })
+  check('a foreground timeout is reported as timedOut', timed.ok === true && timed.timedOut === true, JSON.stringify({ ok: timed.ok, timedOut: timed.timedOut, exit: timed.exitCode }))
+  check('the timeout taskkills the remote tree by the self-reported PID', await waitFor(() => taskkillSeen > before), `taskkillSeen=${taskkillSeen}`)
+  const afterTimeout = await client.execShell('echo JOB-after-timeout', { cwd: '/C:/Windows/Temp', timeoutMs: 10000 })
+  check('the pooled connection survives that timeout', afterTimeout.ok && afterTimeout.exitCode === 0, JSON.stringify({ ok: afterTimeout.ok, exit: afterTimeout.exitCode }))
 }
 
 for (const s of heldStreams) { try { s.close() } catch {} }
