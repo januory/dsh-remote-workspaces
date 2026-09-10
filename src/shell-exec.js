@@ -17,7 +17,7 @@
  * routing by the path alone therefore sent those commands to the local DSH host.
  */
 
-import { SshClient, shellQuote, PROBE_UNKNOWN_MSG } from './transport.js'
+import { SshClient, shellQuote, PROBE_UNKNOWN_MSG, reapPidCommand } from './transport.js'
 import { isRemoteCwd, parseSshUri } from './ssh-uri.js'
 import { findByCwd } from './registry.js'
 import { lstatSync } from 'node:fs'
@@ -324,7 +324,25 @@ export class SshShellExecutor {
     const client = this.clientForRemote(parsed.host, parsed.user, parsed.port)
     const path = parsed.path
     const log = `${path.replace(/\/+$/, '')}/.dsh-bg-${Date.now()}-${Math.floor(Math.random() * 1e6)}.log`
-    const launchScript = `cd ${shellQuote(path)} || exit 1\nnohup sh -c ${shellQuote(spec.command)} > ${shellQuote(log)} 2>&1 &\necho $!`
+    // POSIX launcher. `setsid` puts the command in its OWN session and process
+    // group, so the pid this script reports — `$!` — is that GROUP's leader and
+    // `kill -TERM -<pid>` reaches the whole tree (see `reapPidCommand`). Without
+    // it `$!` is only the `sh -c` wrapper: `sh` forks for a simple command
+    // instead of exec'ing it, so killing the wrapper reparented the real work to
+    // init and it kept running (verified on a real Linux host). `nohup` is gone
+    // because a session of its own cannot be reached by a terminal SIGHUP; the
+    // `else` branch keeps hosts with no `setsid` utility (e.g. macOS) working,
+    // where the group kill simply fails over to the single-pid form. stdin is
+    // /dev/null so the job never depends on the (short-lived) exec channel.
+    const launcher = [
+      'if command -v setsid >/dev/null 2>&1; then',
+      `setsid sh -c ${shellQuote(spec.command)} > ${shellQuote(log)} 2>&1 </dev/null &`,
+      'else',
+      `nohup sh -c ${shellQuote(spec.command)} > ${shellQuote(log)} 2>&1 </dev/null &`,
+      'fi',
+      'echo $!',
+    ].join('\n')
+    const launchScript = `cd ${shellQuote(path)} || exit 1\n${launcher}`
 
     let pid = null
     let offset = 0
@@ -357,7 +375,10 @@ export class SshShellExecutor {
         if (proc.status !== 'running') return false
         proc.status = 'killed'
         if (streamCtl !== null) streamCtl.terminate()
-        else if (pid !== null) void client.run(`kill ${pid} 2>/dev/null || true`)
+        // POSIX: the recorded pid leads the command's own session/process
+        // group, so the negative-pid kill reaches the real work — a bare
+        // `kill <pid>` only reaped the `sh -c` wrapper and orphaned its child.
+        else if (pid !== null) void client.run(reapPidCommand(pid, 'posix'))
         return true
       },
       done: (async () => {
@@ -425,6 +446,13 @@ export class SshShellExecutor {
           return
         }
         pid = parsedPid
+        // kill() can land while the launcher is still in flight; the pid is the
+        // only handle on the remote tree, so reap it now rather than leaving a
+        // "killed" job running on the remote.
+        if (proc.status !== 'running') {
+          await client.run(reapPidCommand(pid, 'posix'))
+          return
+        }
         // Poll the log into the buffer (readOutput stays synchronous).
         const poll = async () => {
           if (proc.status !== 'running') return

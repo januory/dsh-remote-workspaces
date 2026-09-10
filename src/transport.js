@@ -424,6 +424,47 @@ const RETRY_DELAY_MS = 200
 /** Open another pooled connection once current ones host at least this many channels. */
 const CHANNELS_PER_CONN_SPREAD_AT = 3
 
+/**
+ * The PID self-report a command's script starts with, per dialect. The script
+ * runs INSIDE the shell that owns the exec channel, so its `$$` / `$PID` is the
+ * process a timeout or abort must reap — and on POSIX that process is also the
+ * LEADER of a fresh session and process group, because sshd gives every
+ * connection its own session (`setsid`) and its children inherit the pgid.
+ * The marker is the script's FIRST stdout line and is parsed out before the
+ * command's own output reaches the caller.
+ *
+ * Only `execShell` prepends it. `run()` sends bare commands whose stdout the
+ * caller parses (`uname -s`, `sha256sum`, `stat`), so a marker would pollute
+ * the parse — its timeout path is deliberately left unresolved.
+ */
+export function pidMarkerCommand(command, family) {
+  return family === 'windows'
+    ? `Write-Output ('DWSH_PID=' + $PID)\n${command}`
+    : `echo DWSH_PID=$$\n${command}`
+}
+
+/**
+ * The remote reaper for a self-reported PID — the command TREE, not just the
+ * process that reported it.
+ *
+ * POSIX: a NEGATIVE pid targets the whole process group. A bare `kill <pid>`
+ * reaps only the wrapper shell: `sh -c '<cmd>'` forks for a simple command
+ * instead of exec'ing it, and closing the exec channel does not HUP the tree
+ * (no controlling terminal, no session teardown), so the real work was
+ * reparented to init and kept running — verified on a real Linux host, where
+ * `$!` was the dash wrapper and its child survived the wrapper's death. The
+ * `|| kill <pid>` fallback covers a shell that never became a group leader
+ * (negative kill has no such group → ESRCH), where only the one process can be
+ * reached. Loop-free and silent on failure.
+ *
+ * Windows: `taskkill /T` is the verified tree reaper — a closed channel does
+ * not reap the tree there either.
+ */
+export function reapPidCommand(remotePid, family) {
+  if (family === 'windows') return `taskkill /PID ${remotePid} /T /F`
+  return `kill -TERM -${remotePid} 2>/dev/null || kill -TERM ${remotePid} 2>/dev/null || true`
+}
+
 const execPools = new Map()
 let poolSweeper = null
 
@@ -633,8 +674,13 @@ export class SshClient {
   /**
    * Run one remote command with the shell-executor contract: cwd, timeout,
    * bounded (tail-kept) stdout/stderr, stdin, and an abort signal that closes
-   * the exec channel (SIGHUP on the remote). Resolves with exitCode/signal,
-   * timedOut/aborted first-cause, and `{ text, truncated }` outputs.
+   * the exec channel. Resolves with exitCode/signal, timedOut/aborted
+   * first-cause, and `{ text, truncated }` outputs.
+   *
+   * Closing the channel is NOT enough to stop the remote command: the tree is
+   * reaped by the PID the script self-reports (a process GROUP on POSIX), so a
+   * timeout or abort does not leave the command running on the remote — see the
+   * note below the signature.
    *
    * The command text is executed through the target's default shell. On
    * Windows targets the script is built per detected default shell
@@ -646,14 +692,16 @@ export class SshClient {
     if (profile.family === 'unknown') {
       return { ok: false, error: PROBE_UNKNOWN_MSG }
     }
-    const windows = profile.family === 'windows'
     // A pooled connection can never be ended to reap a timed-out command (it
-    // carries sibling channels), and closing a Windows exec channel does NOT
-    // reap the remote process tree (verified). So the script self-reports its
-    // PID — the same trick as execStream — and a timeout/abort taskkills that
-    // tree before the channel is closed. The marker line is stripped from
-    // stdout, so callers see exactly the command's own output.
-    const markerCommand = windows ? "Write-Output ('DWSH_PID=' + $PID)\n" + command : command
+    // carries sibling channels), and closing an exec channel does NOT reap the
+    // remote process tree — verified for Windows AND for POSIX, where the
+    // orphaned command keeps running (it has no controlling terminal to receive
+    // a SIGHUP). So the script self-reports its PID — the same trick as
+    // execStream — and a timeout/abort reaps that PID's tree before the channel
+    // is closed: `taskkill /T` on Windows, a negative-pid process-GROUP kill on
+    // POSIX (see `reapPidCommand`). The marker line is stripped from stdout, so
+    // callers see exactly the command's own output.
+    const markerCommand = pidMarkerCommand(command, profile.family)
     const script = buildExecScript(profile, markerCommand, cwd)
     const started = Date.now()
     for (let attempt = 0; ; attempt++) {
@@ -672,7 +720,7 @@ export class SshClient {
         deadline: Math.max(0, timeoutMs - (Date.now() - started)),
         stdoutMaxBytes,
         stderrMaxBytes,
-        pidMarker: windows,
+        pidMarker: true,
       })
       lease.release(outcome.healthy)
       if (!outcome.ok) {
@@ -859,21 +907,22 @@ export class SshClient {
       let aborting = false
       let timer
       let stream = null
-      // The Windows PID marker (see execShell) is the script's FIRST stdout
-      // line, which may arrive split across chunks; parse it out of a small head
-      // buffer so a timeout can `taskkill /T` the exact remote tree.
+      // The self-reported PID marker (see execShell) is the script's FIRST
+      // stdout line, which may arrive split across chunks; parse it out of a
+      // small head buffer so a timeout can reap the exact remote tree.
       let pidResolve
       const pid = new Promise((res) => { pidResolve = res })
       if (!pidMarker) pidResolve(null)
       const pidTimer = setTimeout(() => pidResolve(null), 8000)
       // Reap the remote tree by PID. Closing the channel alone leaves a Windows
-      // command (and its children) running; the pooled connection must stay up
+      // command (and its children) running — and on POSIX it leaves the whole
+      // reparented command tree running; the pooled connection must stay up
       // because sibling channels may share it.
       const reapRemoteTree = () => {
         if (!pidMarker) return
         pid.then((remotePid) => {
           if (typeof remotePid !== 'number' || remotePid <= 0) return
-          void this.execShell(`taskkill /PID ${remotePid} /T /F`, {
+          void this.execShell(reapPidCommand(remotePid, profile.family), {
             timeoutMs: 15000, stdoutMaxBytes: 4096, stderrMaxBytes: 4096,
           }).catch(() => {})
         })
