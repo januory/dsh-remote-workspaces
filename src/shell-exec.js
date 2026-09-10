@@ -3,17 +3,25 @@
  * harness `ShellExecutor` subclass, so the bundle resolves with no harness
  * import and Cordis does not dual-package).
  *
- * Routes by the resolved workdir: `ssh://[user@]host[:port]/path` workdirs
- * execute on the remote over ssh2 `exec`; ordinary local workdirs execute
- * locally through `ctx.subprocess` + `ctx.sandbox` (the same confinement the
- * harness's `bash-sandbox`/`pwsh-sandbox` apply).
+ * Routing is decided by the SESSION, not by the workdir's spelling: inside a
+ * remote workspace session every command runs on that remote host, whatever
+ * form the workdir arrives in; only an ordinary local session runs locally.
+ * `ssh://[user@]host[:port]/path` workdirs execute on the remote over ssh2
+ * `exec`; local workdirs execute through `ctx.subprocess` + `ctx.sandbox` (the
+ * same confinement the harness's `bash-sandbox`/`pwsh-sandbox` apply).
+ *
+ * This matters because the harness passes the model's explicit `workdir`
+ * through verbatim when it is absolute (`tool-pwsh`'s `resolveWorkdir`), and an
+ * agent in a remote session naturally spells it the way the REMOTE host does —
+ * `C:\Windows\Temp` for `…/C--Windows--Temp`, `/data/x` for `/data`. Judging
+ * routing by the path alone therefore sent those commands to the local DSH host.
  */
 
 import { SshClient, shellQuote, PROBE_UNKNOWN_MSG } from './transport.js'
 import { isRemoteCwd, parseSshUri } from './ssh-uri.js'
 import { findByCwd } from './registry.js'
 import { lstatSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve as resolvePath } from 'node:path'
 
 const ENV_OVERRIDES = { NO_COLOR: '1', TERM: 'dumb', PAGER: 'cat', GIT_PAGER: 'cat' }
 const DEFAULT_TIMEOUT_MS = 120_000
@@ -89,6 +97,49 @@ function parseRemoteWorkdir(workdir) {
   return { host: parsed.host, user: parsed.user, port: parsed.port, path: parsed.path }
 }
 
+const DRIVE_PATH = /^([A-Za-z]):[\\/](.*)$/
+/** A drive path in the remote-spelled form the plugin stores and displays (`/C:/…`). */
+const DRIVE_REMOTE_PATH = /^\/[A-Za-z]:(\/|$)/
+
+/** The `ssh://` workdir that routes to this anchor at this remote path. */
+function sshUriFor(rec, remotePath) {
+  return `ssh://${rec.user ? `${rec.user}@` : ''}${rec.host}${rec.port ? `:${rec.port}` : ''}${remotePath}`
+}
+
+/** The anchor's own remote origin: `remotePath` plus the registered subpath. */
+function anchorRemoteRoot(hit) {
+  return hit.remoteSubpath === '' ? hit.remotePath : `${hit.remotePath.replace(/\/+$/, '')}/${hit.remoteSubpath}`
+}
+
+/** Absolute in EITHER host's spelling: the local host may not be the remote's OS. */
+function isSpelledAbsolute(path) {
+  return path.startsWith('/') || path.startsWith('\\') || DRIVE_PATH.test(path)
+}
+
+function isWindowsRemote(rec) {
+  if (rec?.os?.family === 'windows') return true
+  return typeof rec?.remotePath === 'string' && DRIVE_REMOTE_PATH.test(rec.remotePath)
+}
+
+/**
+ * Spell an absolute workdir the way the REMOTE host spells paths, or
+ * `undefined` when that path cannot belong to the remote (a Windows drive path
+ * in a POSIX session) — the caller must then refuse rather than fall back to
+ * the local machine. Windows remotes take the plugin's own `/C:/…` form, which
+ * is what `anchors.json` stores and what remote `cd` receives.
+ */
+function remoteSpelling(workdir, rec) {
+  const drive = DRIVE_PATH.exec(workdir)
+  if (isWindowsRemote(rec)) {
+    if (drive !== null) return `/${drive[1].toUpperCase()}:/${drive[2].replace(/\\/g, '/')}`.replace(/\/$/, '')
+    if (DRIVE_REMOTE_PATH.test(workdir)) return workdir
+    if (workdir.startsWith('\\\\')) return workdir.replace(/\\/g, '/').replace(/^\/+/, '//')
+    return workdir.startsWith('/') ? workdir : undefined
+  }
+  if (workdir.startsWith('/')) return workdir
+  return undefined
+}
+
 export class SshShellExecutor {
   constructor({ clientForRemote, getPolicy, getSandbox, getSubprocess }) {
     this.clientForRemote = clientForRemote
@@ -103,25 +154,77 @@ export class SshShellExecutor {
   }
 
   /**
-   * Translate the workdir into the execution world: a registered anchor (or
-   * `ssh://` URI) becomes an `ssh://host/remotepath` URI; local paths pass
-   * through. The URI prefix is the run/start routing marker.
+   * The session's own remote origin, read from the per-call sandbox policy:
+   * `workspaceRoot` is the session cwd, which for a remote workspace session is
+   * the local anchor path. `undefined` for an ordinary local session. This is
+   * the routing key — the workdir alone is not (it arrives in the remote's own
+   * spelling, which matches no anchor).
    */
-  translateWorkdir(workdir) {
+  sessionAnchor(spec) {
+    const root = this.policy(spec)?.workspaceRoot
+    if (typeof root !== 'string' || root === '') return undefined
+    return findByCwd(root)
+  }
+
+  /**
+   * Translate the workdir into the execution world. A registered anchor (or an
+   * `ssh://` URI) becomes an `ssh://host/remotepath` URI, as before. The new
+   * rule: inside a REMOTE session, an absolute workdir the model spelled the
+   * remote's way is routed to that remote instead of being taken for a local
+   * path — the harness passes an absolute workdir through verbatim, so this is
+   * what keeps `workdir: C:\Windows\Temp` (session `…\C--Windows--Temp`) from
+   * silently running on the local DSH host. A path that cannot belong to the
+   * session's host is left local-looking on purpose: {@link
+   * assertNotLocalInRemoteSession} then refuses it loudly rather than guessing.
+   * A local session keeps local paths local.
+   */
+  translateWorkdir(workdir, session) {
     if (typeof workdir !== 'string' || workdir === '') return workdir
     if (isRemoteCwd(workdir)) return workdir
     const hit = findByCwd(workdir)
-    if (hit === undefined) return workdir
-    const path = hit.remoteSubpath === '' ? hit.remotePath : `${hit.remotePath.replace(/\/+$/, '')}/${hit.remoteSubpath}`
-    return `ssh://${hit.user ? `${hit.user}@` : ''}${hit.host}${hit.port ? `:${hit.port}` : ''}${path}`
+    if (hit !== undefined) return sshUriFor(hit, anchorRemoteRoot(hit))
+    if (session === undefined) return workdir
+    if (isSpelledAbsolute(workdir)) {
+      const spelled = remoteSpelling(workdir, session)
+      return spelled === undefined ? workdir : sshUriFor(session, spelled)
+    }
+    // Relative: only reachable when a caller skipped the harness's own
+    // session-cwd resolution — resolve it against the anchor, then re-route.
+    const joined = resolvePath(session.anchorPath, workdir)
+    const nested = findByCwd(joined)
+    return nested === undefined ? joined : sshUriFor(nested, anchorRemoteRoot(nested))
+  }
+
+  /**
+   * Invariant: inside a remote workspace session nothing may execute on the
+   * LOCAL host. `resolve()` maps every workdir into the remote world, so a spec
+   * that still carries a local workdir here either bypassed `resolve()` or names
+   * a path that cannot exist on the remote (e.g. a drive path in a POSIX
+   * session). Refuse loudly: silently running the command against the local DSH
+   * host is how an agent ends up reading and writing the wrong machine's files.
+   */
+  assertNotLocalInRemoteSession(spec) {
+    if (isRemoteCwd(spec.workdir)) return
+    const session = this.sessionAnchor(spec)
+    if (session === undefined) return
+    const target = `${session.user ? `${session.user}@` : ''}${session.host}${session.port ? `:${session.port}` : ''}`
+    throw new Error(
+      `refusing to run locally: this session is the remote workspace ${target} (${anchorRemoteRoot(session)}), `
+      + `but the workdir "${spec.workdir}" is not a path on that host — use a path relative to the workspace root, `
+      + 'the workspace path itself, or an explicit ssh:// workdir',
+    )
   }
 
   resolve(request) {
     const timeoutMs = clamp(request.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS)
     const stdoutMaxBytes = request.stdoutMaxBytes ?? DEFAULT_STDOUT_MAX_BYTES
+    const session = this.sessionAnchor(request)
+    // A remote session must never default to the DSH process cwd (the local
+    // host's) when the caller omits a workdir.
+    const workdir = request.workdir ?? session?.anchorPath ?? process.cwd()
     return {
       command: request.command,
-      workdir: this.translateWorkdir(request.workdir ?? process.cwd()),
+      workdir: this.translateWorkdir(workdir, session),
       timeoutMs,
       stdoutMaxBytes,
       ...(request.signal ? { signal: request.signal } : {}),
@@ -134,11 +237,13 @@ export class SshShellExecutor {
 
   async run(spec) {
     if (isRemoteCwd(spec.workdir)) return this.remoteRun(spec)
+    this.assertNotLocalInRemoteSession(spec)
     return this.localRun(spec)
   }
 
   start(spec) {
     if (isRemoteCwd(spec.workdir)) return this.remoteStart(spec)
+    this.assertNotLocalInRemoteSession(spec)
     return this.localStart(spec)
   }
 

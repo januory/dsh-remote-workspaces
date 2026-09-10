@@ -14,7 +14,7 @@
 - **多主机注册表** —— 增删改 SSH 主机（别名 / 主机 / 端口 / 用户 / 密钥或密码）。凭据在本地用 AES-256-GCM 加密落盘，绝不会回传到浏览器。
 - **`~/.ssh/config` 导入** —— 列出已配置的别名并自动填充连接表单。
 - **连接测试** —— 使用前先验证主机连通性。
-- **透明的工具路由** —— `read`/`write`/`edit` 走 SFTP，`grep`/`glob` 在远端跑ripgrep，`bash`/`pwsh` 命令通过 ssh2 exec 执行。本地路径沿用 harness 自身的沙箱。
+- **透明的工具路由** —— `read`/`write`/`edit` 走 SFTP，`grep`/`glob` 在远端跑ripgrep，`bash`/`pwsh` 命令通过 ssh2 exec 执行。路由由会话决定，而不是由路径写法决定：远程工作区内每条命令都在那台主机上执行，指向该主机上不存在路径的 workdir 会被拒绝，而不是落到本地执行。本地会话沿用 harness 自身的沙箱。
 - **感知权限策略的远端写操作** —— harness 的文件策略同样作用于远程工作区：`read-only` 会拒绝 `write`/`edit` 和远程 shell 命令，`workspace-write` 把 `write`/`edit` 限制在远程工作区根目录（以及 `/tmp`）内、而远程 shell 命令需经 `danger-full-access` 审批后放行，`danger-full-access` 则交由 SSH 账号自身权限决定。
 
 ## 工作原理
