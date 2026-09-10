@@ -323,6 +323,39 @@ function describeErrorEn(error) {
   return message
 }
 
+/**
+ * Signatures of a command that failed because the SCRIPT DIALECT did not match
+ * the host — i.e. the cached remote profile went stale because the host's
+ * default shell changed (or sshd was reconfigured) under a long-lived DSH
+ * process. Matching one clears the cached profile so the next call re-probes
+ * instead of failing every command until DSH restarts.
+ *
+ * Deliberately narrow: almost every pattern names a wrapper token the plugin
+ * itself emitted (`Set-Location`, the POSIX `||` glue, the `powershell`
+ * envelope), so an ordinary failing command is not mistaken for dialect drift.
+ * The one broad pattern is the Win32-123 phrasing a POSIX `cd` produces on
+ * cmd.exe.
+ */
+const DIALECT_MISMATCH_PATTERNS = [
+  // A raw PowerShell script (or a POSIX `cd`) handed to cmd.exe.
+  /['"`]?Set-Location['"`]?[^\n]{0,80}(not recognized|不是内部或外部命令)/i,
+  /['"`]?cd['"`]?[^\n]{0,80}(not recognized|不是内部或外部命令)/i,
+  // The POSIX `cd 'x' || exit 1` line handed to cmd.exe: Win32 error 123.
+  /(filename, directory name, or volume label syntax is incorrect|文件名、目录名或卷标语法不正确)/i,
+  // The POSIX `||` glue handed to Windows PowerShell 5.1 (a parse error).
+  /(not a valid statement separator|不是此版本中的有效语句分隔符)/i,
+  // A PowerShell script handed to a POSIX shell.
+  /Set-Location[:]?[^\n]{0,80}not found/i,
+  // The cmd envelope needs a `powershell` binary, which a POSIX host lacks.
+  /(^|[\s|;])['"`]?powershell['"`]?[^\n]{0,80}(not recognized|not found|不是内部或外部命令)/i,
+]
+
+function looksLikeDialectMismatch(text) {
+  const s = String(text ?? '')
+  if (s === '') return false
+  return DIALECT_MISMATCH_PATTERNS.some((re) => re.test(s))
+}
+
 // ---------------------------------------------------------------------------
 // Short-lived exec connection pool
 // ---------------------------------------------------------------------------
@@ -498,7 +531,11 @@ export class SshClient {
         await sleepMs(RETRY_DELAY_MS)
         continue
       }
-      return { ...outcome.result, ms: Date.now() - started }
+      const result = { ...outcome.result, ms: Date.now() - started }
+      if (!result.ok && (looksLikeDialectMismatch(result.error) || looksLikeDialectMismatch(result.stderr))) {
+        this.invalidateProfile()
+      }
+      return result
     }
   }
 
@@ -542,6 +579,13 @@ export class SshClient {
         stderrMaxBytes,
       })
       lease.release(outcome.healthy)
+      if (!outcome.ok) {
+        if (looksLikeDialectMismatch(outcome.result.error)) this.invalidateProfile()
+      } else if (outcome.result.exitCode !== 0 && looksLikeDialectMismatch(outcome.result.stderr?.text)) {
+        // The host's shell drifted under the cached profile: drop it so the
+        // next call re-probes instead of failing until DSH restarts.
+        this.invalidateProfile()
+      }
       if (!outcome.ok && attempt === 0 && outcome.presend) {
         await sleepMs(RETRY_DELAY_MS)
         continue
@@ -1059,6 +1103,7 @@ export class SshClient {
           s.on('close', (code) => {
             if (outLf !== null) { const rest = outLf.flush(); if (rest !== '') push(out)(rest) }
             if (errLf !== null) { const rest = errLf.flush(); if (rest !== '') push(err)(rest) }
+            if (code !== 0 && looksLikeDialectMismatch(err.buf)) ssh.invalidateProfile()
             finish({ exitCode: code })
           })
           s.end()
@@ -1113,6 +1158,16 @@ export class SshClient {
       }
     }
     return profile
+  }
+
+  /**
+   * Drop the cached profile for this target (dialect drift self-heal). The next
+   * `profile()` call re-probes; a failed probe is never cached, so re-probing
+   * always sees the host's CURRENT default shell.
+   */
+  invalidateProfile() {
+    REMOTE_PROFILE_CACHE.delete(profileCacheKey(this))
+    this._os = undefined
   }
 
   async remoteOs() {
