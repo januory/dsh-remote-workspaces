@@ -10,8 +10,9 @@
  *    `sidebar.workspaces.directoryFlow`) at a lower priority so it shadows the
  *    native chooser and offers BOTH "本地文件夹" and "远程目录".
  *
- * 3. A "Shell" tab type (kind `shell`, guide entry on the 开始/Start page)
- *    whose body renders a real xterm terminal backed by a local PTY session.
+ * 3. A "Shell" tab type (kind `shell`, guide entry on the 开始/Start page,
+ *    terminal glyph on the tab chip) whose body renders a real xterm terminal
+ *    backed by a local PTY session.
  *
  * Built by `scripts/build-client.mjs` (esbuild) into `lib/client.js`: the
  * bundle registers `window.__ModuleLoader__.load({id, factory})`, keeps `react`
@@ -1221,10 +1222,12 @@ function unwrapRemote(res) {
       )
     }
 
-    // Terminal glyph for the 开始 page entry box (drawn at 16px; color rides currentColor).
+    // Terminal glyph for the 开始 page entry box and the tab chip (drawn at 16px;
+    // color rides currentColor). `className`/`style` pass through so each seat can
+    // place it the way the harness's own chip glyphs do (see ShellTitle).
     function ShellIcon(props) {
       var size = props && props.size ? props.size : 16
-      return React.createElement('svg', {
+      var attrs = {
         width: size,
         height: size,
         viewBox: '0 0 16 16',
@@ -1235,10 +1238,33 @@ function unwrapRemote(res) {
         strokeLinejoin: 'round',
         'aria-hidden': 'true',
         xmlns: 'http://www.w3.org/2000/svg',
-      },
+      }
+      if (props && props.className) attrs.className = props.className
+      if (props && props.style) attrs.style = props.style
+      return React.createElement('svg', attrs,
         React.createElement('rect', { x: 1.5, y: 2.5, width: 13, height: 11, rx: 2 }),
         React.createElement('path', { d: 'M4.5 5.5 L7 8 L4.5 10.5' }),
         React.createElement('line', { x1: 8, y1: 10.5, x2: 11.5, y2: 10.5 }),
+      )
+    }
+
+    // The type's chip title: the same terminal glyph before the label, mirroring
+    // the files type's folder sheet. The tab strip's title row is a flex row with
+    // a 5px gap that centres a leading glyph, so the glyph is one more child with
+    // `flex:none` — no wrapper of our own. Without this registration the chip
+    // shows only the `title()` text captured when the tab opened; reading it back
+    // through `useTabInfo` keeps a future live title (the shell's own name)
+    // working without touching this seat.
+    function ShellTitle(props) {
+      var useTabInfo = props && props.useTabInfo
+      var info = null
+      try { info = useTabInfo ? useTabInfo() : null } catch (e) { info = null }
+      var label = info && info.tab && info.tab.title ? info.tab.title : 'Shell'
+      return React.createElement(
+        React.Fragment,
+        null,
+        React.createElement(ShellIcon, { size: 16, style: { flex: 'none' } }),
+        label,
       )
     }
 
@@ -1355,6 +1381,14 @@ function unwrapRemote(res) {
         return ctx.slots.register(
           { name: 'sidebar.right.pane.tab', key: SHELL_ID, inject: function () { return { getRemote: getRemote, getCwd: getCwd, getSessionId: getSessionId } } },
           ShellBody,
+        )
+      })
+      // The chip seat, keyed by the same id as the body (that id — not the kind —
+      // is what the seat dispatches on).
+      ctx.slots.inject('sidebar.right.pane.tab.title', function () {
+        return ctx.slots.register(
+          { name: 'sidebar.right.pane.tab.title', key: SHELL_ID },
+          ShellTitle,
         )
       })
 
