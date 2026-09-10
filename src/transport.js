@@ -470,22 +470,28 @@ export class SshClient {
    * target, so bursty parallel tool calls no longer present the remote sshd
    * with a fresh handshake per command. A failure that happened before the
    * command was sent (nothing ran remotely) retries once.
+   *
+   * `agentFacing: true` switches connection-failure text to English, for the
+   * callers that surface it to the MODEL (background-job launches); the default
+   * Chinese set is what the settings "test connection" card shows the USER.
    */
-  async run(command, { input, timeoutMs } = {}) {
+  async run(command, { input, timeoutMs, agentFacing = false } = {}) {
     const started = Date.now()
     const deadline = timeoutMs ?? this.timeoutMs
+    const describe = agentFacing ? describeErrorEn : describeError
     for (let attempt = 0; ; attempt++) {
       let lease
       try {
         lease = await this._acquireExec()
       } catch (error) {
         if (attempt === 0) { await sleepMs(RETRY_DELAY_MS); continue }
-        return { ok: false, ms: Date.now() - started, error: describeError(error) }
+        return { ok: false, ms: Date.now() - started, error: describe(error) }
       }
       const outcome = await this._execOnLease(lease, {
         command,
         input,
         deadline: Math.max(0, deadline - (Date.now() - started)),
+        describe,
       })
       lease.release(outcome.healthy)
       if (!outcome.ok && attempt === 0 && outcome.presend) {
@@ -653,7 +659,7 @@ export class SshClient {
    * underlying connection may stay pooled, `presend` is true when the
    * failure happened before the command reached the server (safe to retry).
    */
-  _execOnLease(lease, { command, input, deadline }) {
+  _execOnLease(lease, { command, input, deadline, describe = describeError }) {
     return new Promise((resolve) => {
       const conn = lease.conn
       let settled = false
@@ -667,7 +673,7 @@ export class SshClient {
         resolve({ ok: result.ok, presend, healthy, result })
       }
       const onConnError = (error) => {
-        finish({ ok: false, error: describeError(error) }, { healthy: false, presend: stream === null })
+        finish({ ok: false, error: describe(error) }, { healthy: false, presend: stream === null })
       }
       conn.on('error', onConnError)
       timer = setTimeout(() => {
@@ -680,7 +686,7 @@ export class SshClient {
           if (settled) return
           if (err) {
             // exec failed before a channel existed -> the command never ran.
-            finish({ ok: false, error: describeError(err) }, { healthy: false, presend: true })
+            finish({ ok: false, error: describe(err) }, { healthy: false, presend: true })
             return
           }
           stream = s
@@ -695,7 +701,7 @@ export class SshClient {
           else s.end(String(input))
         })
       } catch (error) {
-        finish({ ok: false, error: describeError(error) }, { healthy: false, presend: true })
+        finish({ ok: false, error: describe(error) }, { healthy: false, presend: true })
       }
     })
   }
@@ -905,6 +911,13 @@ export class SshClient {
    * must actively `taskkill /T` the remote process first; the channel close
    * is only a fallback).
    *
+   * The channel rides the SAME per-target connection pool as `run()` and
+   * `execShell()`: N parallel background jobs multiplex over at most
+   * `EXEC_POOL_MAX_CONNS` connections instead of opening one SSH session each.
+   * A pooled connection is shared, so a job never ends it — `terminate()`
+   * reaps the remote tree by PID and closes only its own channel, and only a
+   * pid-less abort marks the connection for drain-teardown.
+   *
    * On Windows the remote script is prefixed with a self-reporting PID line
    * (`DWSH_PID=<pid>`), which is parsed out of the first output chunk so the
    * controller can tree-kill the exact process. Resolves a controller:
@@ -929,25 +942,57 @@ export class SshClient {
     // process whose tree taskkill must reap.
     const markerCommand = windows ? "Write-Output ('DWSH_PID=' + $PID)\n" + command : command
     const script = buildExecScript(profile, markerCommand, cwd)
-    return await new Promise((resolve, reject) => {
-      const conn = new Client()
+    let lease
+    try {
+      lease = await this._acquireExec()
+    } catch (error) {
+      // Same controller shape as a failed launch: the background tool learns
+      // the reason through `exit` instead of an exception.
+      return {
+        readOut: () => ({ delta: '', lossy: false }),
+        readErr: () => ({ delta: '', lossy: false }),
+        exit: Promise.resolve({ error: describeErrorEn(error) }),
+        terminate() {},
+      }
+    }
+    return await new Promise((resolve) => {
+      const conn = lease.conn
       const out = { buf: '', pos: 0, max: stdoutMaxBytes, lossy: false }
       const err = { buf: '', pos: 0, max: stderrMaxBytes, lossy: false }
       let stream
       let settled = false
+      let released = false
       let pidResolve
       const pid = new Promise((res) => { pidResolve = res })
       // A stuck launch must not hold terminate() forever.
       const pidTimer = setTimeout(() => pidResolve(null), 8000)
       let exitResolve
       const exit = new Promise((res) => { exitResolve = res })
-      const finish = (value) => {
+      // The pooled connection is SHARED with other channels (short execs and
+      // sibling background jobs), so a finished job releases its lease instead
+      // of ending the connection; `healthy: false` lets the pool drop the
+      // connection once every channel on it is done.
+      const release = (healthy) => {
+        if (released) return
+        released = true
+        lease.release(healthy)
+      }
+      const finish = (value, { healthy = true } = {}) => {
         if (settled) return
         settled = true
         clearTimeout(pidTimer)
-        try { conn.end() } catch {}
+        conn.removeListener('error', onConnError)
+        conn.removeListener('close', onConnClose)
+        release(healthy)
         exitResolve(value)
       }
+      const onConnError = (connError) => finish({ error: describeErrorEn(connError) }, { healthy: false })
+      // A silent connection close (server dropped us without a DISCONNECT
+      // packet) emits no 'error'; without this a long-lived job would never
+      // settle — there is no channel timeout on a background job.
+      const onConnClose = () => finish({ error: 'connection closed unexpectedly' }, { healthy: false })
+      conn.on('error', onConnError)
+      conn.on('close', onConnClose)
       const push = (target) => (chunk) => {
         const piece = String(chunk)
         if (target.buf.length + piece.length > target.max) { target.lossy = true; return }
@@ -1002,9 +1047,12 @@ export class SshClient {
         const text = errLf === null ? String(chunk) : errLf.feed(chunk)
         if (text !== '') push(err)(text)
       }
-      conn.on('ready', () => {
+      // The pooled connection is already authenticated, so exec starts right
+      // away — there is no per-job 'ready' to wait for.
+      try {
         conn.exec(script, (execError, s) => {
-          if (execError) { finish({ error: execError.message }); return }
+          if (settled) return
+          if (execError) { finish({ error: describeErrorEn(execError) }, { healthy: false }); return }
           stream = s
           s.on('data', onOut)
           s.stderr.on('data', onErr)
@@ -1015,27 +1063,33 @@ export class SshClient {
           })
           s.end()
         })
-      })
-      conn.on('error', (connError) => finish({ error: connError.message }))
-      try { conn.connect(this.connectConfig()) } catch (connectError) { finish({ error: connectError.message }) }
+      } catch (error) {
+        finish({ error: describeErrorEn(error) }, { healthy: false })
+      }
       resolve({
         readOut: reader(out),
         readErr: reader(err),
         exit,
         terminate() {
-          const doClose = () => {
+          // On Windows the verified reaper is `taskkill /PID <pid> /T /F`; the
+          // channel close is only a fallback. The connection stays pooled —
+          // ending it would kill sibling jobs sharing it.
+          const closeChannel = (healthy) => {
             try { if (stream) stream.close() } catch {}
-            try { conn.end() } catch {}
             // Settle explicitly: the remote 'close' event is not guaranteed.
-            finish({ exitCode: null })
+            finish({ exitCode: null }, { healthy })
           }
           pid.then((remotePid) => {
             if (typeof remotePid === 'number' && remotePid > 0) {
               void ssh.execShell(`taskkill /PID ${remotePid} /T /F`, {
                 timeoutMs: 15000, stdoutMaxBytes: 4096, stderrMaxBytes: 4096,
-              }).catch(() => {}).finally(doClose)
+              }).catch(() => {}).finally(() => closeChannel(true))
             } else {
-              doClose()
+              // No PID to reap with: closing the channel alone does not
+              // guarantee the remote tree dies, so drain-tear this connection
+              // (it ends once no other channel uses it).
+              lease.teardown()
+              closeChannel(false)
             }
           })
         },

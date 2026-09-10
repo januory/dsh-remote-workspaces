@@ -118,6 +118,27 @@ check('remote session: start() refuses it too (background jobs)', startVerdict.i
 const localVerdict = await verdict({ command: 'x', workdir: 'C:/some/local/dir' })
 check('local session: run() is NOT refused (reaches the local executor)', localVerdict.includes('subprocess service unavailable'), localVerdict)
 
+// --- remoteStart surfaces a launch failure instead of an empty job ----------
+{
+  const fakeClient = {
+    profile: async () => ({ family: 'posix', os: 'linux', shell: 'posix' }),
+    run: async () => ({ ok: false, ms: 3, exitCode: 1, stdout: '', stderr: '', error: 'connection timed out' }),
+  }
+  const startEx = new SshShellExecutor({
+    clientForRemote: () => fakeClient,
+    getPolicy: () => ({ resolve: () => ({ mode: 'danger-full-access' }) }),
+    getSandbox: () => undefined,
+    getSubprocess: () => undefined,
+  })
+  const proc = startEx.start({ command: 'sleep 1', workdir: 'ssh://root@10.0.0.7:22/data/x', timeoutMs: 1000 })
+  await proc.done
+  const first = proc.readOutput()
+  const second = proc.readOutput()
+  check('remote background launch failure is surfaced to the caller', first.delta.includes('[stderr]') && first.delta.includes('connection timed out'), JSON.stringify(first.delta))
+  check('the launch failure is reported exactly once', second.delta === '', JSON.stringify(second.delta))
+  check('the failed background job reports killed', proc.status === 'killed', proc.status)
+}
+
 rmSync(home, { recursive: true, force: true })
 
 const failed = results.filter((r) => !r.ok)

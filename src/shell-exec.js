@@ -341,7 +341,17 @@ export class SshShellExecutor {
       readOutput() {
         const delta = buffer.slice(offset)
         offset = buffer.length
-        return { delta, lossy: false }
+        // A launch failure is reported through the job's stderr exactly once,
+        // mirroring localStart (and the Windows branch's own [stderr] merge).
+        // Without this the background job ended as an empty, reason-less
+        // result and the model could not tell why it never started.
+        const errText = spawnError === undefined ? '' : messageOf(spawnError)
+        spawnError = undefined
+        const separator = delta.length > 0 && !delta.endsWith('\n') ? '\n' : ''
+        return {
+          delta: delta + (errText.length > 0 ? `${separator}[stderr]\n${errText}` : ''),
+          lossy: false,
+        }
       },
       kill() {
         if (proc.status !== 'running') return false
@@ -402,7 +412,7 @@ export class SshShellExecutor {
           proc.exitCode = typeof outcome.exitCode === 'number' ? outcome.exitCode : null
           return
         }
-        const launched = await client.run(launchScript)
+        const launched = await client.run(launchScript, { agentFacing: true })
         if (!launched.ok) {
           spawnError = new Error((launched.stderr ?? '').trim() || launched.error || 'background spawn failed')
           proc.status = 'killed'
