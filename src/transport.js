@@ -367,6 +367,93 @@ function connectionOpenMessageFor(error, agentFacing) {
   return channelOpenMessage({ ...parts, agentFacing })
 }
 
+/** Stage label for a remote-refused exec request, for the USER (Chinese). */
+const EXEC_STAGE_USER = '执行请求'
+
+/**
+ * Message for an EXEC REQUEST the remote refused: sshd answered the SSH
+ * CHANNEL_REQUEST with CHANNEL_FAILURE, so its `do_exec` never spawned the
+ * shell and the command did not run. ssh2 flattens that to a bare
+ * "Unable to exec" (`reqExec` in ssh2's client.js), which named neither the host
+ * nor the stage — indistinguishable from a transport failure. This carries the
+ * same `(target, stage)` shape as every other channel failure, plus the payload
+ * size and the attempt count, because the refusal is deterministic in the
+ * payload BYTES (see {@link retryVariantOf}).
+ *
+ * `exec` is a new stage: the connection was usable and the request was sent, so
+ * neither `connect`, `handshake`, `subsystem` nor `shell` describes it.
+ */
+function execRefusedMessage({ agentFacing, target, bytes, attempts }) {
+  if (agentFacing) {
+    const tried = attempts > 1 ? `, attempts: ${attempts}` : ''
+    return `SSH exec request refused by the remote; the command did not run (target: ${target}, stage: exec, payload: ${bytes} bytes${tried})`
+  }
+  const triedZh = attempts > 1 ? `，尝试 ${attempts} 次` : ''
+  return `SSH 执行请求被远端拒绝，命令未执行（目标：${target}，阶段：${EXEC_STAGE_USER}，载荷：${bytes} 字节${triedZh}）`
+}
+
+/**
+ * A remote-refused exec request, carrying the parts each audience needs to
+ * re-render (agent English / user Chinese) instead of one baked-in string. The
+ * rendered `message` is the agent-facing (English) form.
+ */
+function execRefusedFailure({ target, bytes, attempts }) {
+  const parts = { target, bytes, attempts }
+  const error = new Error(execRefusedMessage({ ...parts, agentFacing: true }))
+  error.execRefused = parts
+  return error
+}
+
+/** Re-render an {@link execRefusedFailure} for one audience, or undefined. */
+function execRefusedMessageFor(error, agentFacing) {
+  const parts = error !== null && typeof error === 'object' ? error.execRefused : undefined
+  if (parts === undefined) return undefined
+  return execRefusedMessage({ ...parts, agentFacing })
+}
+
+/**
+ * True when ssh2 handed back its fallback for a server-side CHANNEL_FAILURE on
+ * the exec request — `reqExec`'s `new Error('Unable to exec')`, which ssh2 emits
+ * ONLY for `had_err === true` (a real CHANNEL_FAILURE reply; other failures come
+ * back as their own Error). sshd sends no reason with it, so this test is the
+ * only thing that separates "the remote refused this request" from a transport
+ * failure — and the distinction matters, because only the former is safe to
+ * retry with different bytes (nothing was ever spawned).
+ */
+export function isExecRequestRefused(error) {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return message.trim() === 'Unable to exec'
+}
+
+/**
+ * A byte-varied but semantically identical script (or bare command) for one
+ * retry: `attempt` blank lines before AND after the text.
+ *
+ * Why the bytes must change: the refusal above is deterministic FOR A GIVEN
+ * PAYLOAD. Measured against a real Windows OpenSSH 8.1 host, two payloads of
+ * identical length (1168 chars) — differing by a single base64 character —
+ * were consistently refused and consistently accepted; five wrappers around the
+ * SAME script accepted/refused in a 2/3 split, so it is the request bytes the
+ * remote's `do_exec` chokes on, not the command's meaning or its length (a
+ * 6828-byte payload was accepted). Re-running the very same command produced the
+ * very same payload and failed again every time — which is why a retry has to
+ * change the payload rather than resend it.
+ *
+ * Why blank lines: the variation has to stay inert in every dialect this module
+ * sends — `cmd.exe` (bare `run()` probes), PowerShell (through the base64
+ * envelope, where the script is `iex`'d) and POSIX `sh` (remote POSIX hosts) —
+ * and blank lines are the only universal no-op. A comment would be inert for
+ * PowerShell and sh but not for cmd, and a trailing space breaks a PowerShell
+ * here-string terminator. `attempt` blank lines on each side makes every retry a
+ * different payload in both content and length.
+ */
+export function retryVariantOf(text, attempt) {
+  const n = Number(attempt)
+  if (!Number.isFinite(n) || n <= 0) return text
+  const pad = '\n'.repeat(Math.trunc(n))
+  return `${pad}${text}${pad}`
+}
+
 /**
  * Signatures of a command that failed because the SCRIPT DIALECT did not match
  * the host — i.e. the cached remote profile went stale because the host's
@@ -423,6 +510,13 @@ const EXEC_KEEPALIVE_MS = 15_000
 const RETRY_DELAY_MS = 200
 /** Open another pooled connection once current ones host at least this many channels. */
 const CHANNELS_PER_CONN_SPREAD_AT = 3
+/**
+ * How many times an exec request the REMOTE refused is retried with a
+ * byte-varied payload (so up to `1 + EXEC_REFUSED_RETRIES` attempts). See
+ * `retryVariantOf` for why the payload — not the connection — must change, and
+ * why a retry is safe at all.
+ */
+const EXEC_REFUSED_RETRIES = 2
 
 /**
  * The PID self-report a command's script starts with, per dialect. The script
@@ -566,7 +660,7 @@ export class SshClient {
    * {@link connectionOpenFailure}) is rendered with its real stage instead.
    */
   _agentError(error) {
-    const contextual = connectionOpenMessageFor(error, true)
+    const contextual = connectionOpenMessageFor(error, true) ?? execRefusedMessageFor(error, true)
     if (contextual !== undefined) return contextual
     return `${describeErrorEn(error)} (target: ${this._targetLabel()})`
   }
@@ -618,7 +712,9 @@ export class SshClient {
    * above): at most `EXEC_POOL_MAX_CONNS` SSH sessions are ever open per
    * target, so bursty parallel tool calls no longer present the remote sshd
    * with a fresh handshake per command. A failure that happened before the
-   * command was sent (nothing ran remotely) retries once.
+   * command was sent (nothing ran remotely) retries once; an exec request the
+   * REMOTE refused is retried with a byte-varied payload instead (see
+   * `execShell`), since resending the same bytes is refused again.
    *
    * `agentFacing: true` switches connection-failure text to English, for the
    * callers that surface it to the MODEL (background-job launches); the default
@@ -637,6 +733,10 @@ export class SshClient {
       const text = describe(error)
       return agentFacing ? `${text} (target: ${this._targetLabel()})` : text
     }
+    // The payload actually sent: `retryVariantOf` swaps in a byte-varied copy
+    // after the remote refuses the exec request (see the loop below).
+    let variant = command
+    let refused = 0
     for (let attempt = 0; ; attempt++) {
       let lease
       try {
@@ -646,18 +746,35 @@ export class SshClient {
         return { ok: false, ms: Date.now() - started, error: describeFor(error) }
       }
       const outcome = await this._execOnLease(lease, {
-        command,
+        command: variant,
         input,
         deadline: Math.max(0, deadline - (Date.now() - started)),
         describe,
       })
       lease.release(outcome.healthy)
+      // The remote refused the exec REQUEST (CHANNEL_FAILURE): it never spawned
+      // anything, so a retry is safe — but the SAME payload is refused again, so
+      // the retry carries different bytes. Bounded: a host that refuses
+      // everything still fails instead of looping.
+      if (outcome.refused && refused < EXEC_REFUSED_RETRIES) {
+        refused += 1
+        variant = retryVariantOf(command, refused)
+        await sleepMs(RETRY_DELAY_MS)
+        continue
+      }
       if (!outcome.ok && attempt === 0 && outcome.presend) {
         await sleepMs(RETRY_DELAY_MS)
         continue
       }
       const result = { ...outcome.result, ms: Date.now() - started }
-      if (!result.ok && agentFacing && typeof result.error === 'string' && result.error !== '') {
+      if (outcome.refused) {
+        result.error = execRefusedMessage({
+          agentFacing,
+          target: this._targetLabel(),
+          bytes: variant.length,
+          attempts: refused + 1,
+        })
+      } else if (!result.ok && agentFacing && typeof result.error === 'string' && result.error !== '') {
         result.error = `${result.error} (target: ${this._targetLabel()})`
       }
       if (!result.ok && (looksLikeDialectMismatch(result.error) || looksLikeDialectMismatch(result.stderr))) {
@@ -685,7 +802,13 @@ export class SshClient {
    * The command text is executed through the target's default shell. On
    * Windows targets the script is built per detected default shell
    * (`buildExecScript`): raw PowerShell when PowerShell is the default, a
-   * quote-safe `powershell -EncodedCommand` wrapper when cmd is.
+   * quote-safe base64 `powershell -Command` envelope when cmd is.
+   *
+   * An exec request the REMOTE refuses (`isExecRequestRefused`) is retried up to
+   * `EXEC_REFUSED_RETRIES` times with a byte-varied payload
+   * (`retryVariantOf`), because the refusal is deterministic in the payload: the
+   * same command text produced the same refused payload on every attempt, while
+   * a semantically identical payload with different bytes is accepted.
    */
   async execShell(command, { cwd, timeoutMs = 60000, stdoutMaxBytes = 64000, stderrMaxBytes = 64000, stdin, signal } = {}) {
     const profile = await this.profile()
@@ -702,7 +825,13 @@ export class SshClient {
     // POSIX (see `reapPidCommand`). The marker line is stripped from stdout, so
     // callers see exactly the command's own output.
     const markerCommand = pidMarkerCommand(command, profile.family)
-    const script = buildExecScript(profile, markerCommand, cwd)
+    const baseScript = buildExecScript(profile, markerCommand, cwd)
+    // The payload actually sent: after the remote refuses the exec request the
+    // SCRIPT is re-varied and re-encoded, because on a cmd-default host the
+    // payload is the base64 ENVELOPE of the script — varying the finished
+    // payload would prepend the retry text to the `powershell` command line.
+    let script = baseScript
+    let refused = 0
     const started = Date.now()
     for (let attempt = 0; ; attempt++) {
       let lease
@@ -723,6 +852,27 @@ export class SshClient {
         pidMarker: true,
       })
       lease.release(outcome.healthy)
+      // The remote refused the exec REQUEST (ssh2's bare "Unable to exec"): its
+      // exec handler never spawned the shell, so the command did not run and a
+      // retry is safe. The SAME payload is refused every time, so vary the bytes
+      // rather than resending it. Bounded, so a host that refuses everything
+      // still reports a failure.
+      if (outcome.refused) {
+        refused += 1
+        if (refused <= EXEC_REFUSED_RETRIES) {
+          script = buildExecScript(profile, retryVariantOf(markerCommand, refused), cwd)
+          await sleepMs(RETRY_DELAY_MS)
+          continue
+        }
+        return {
+          ok: false,
+          error: execRefusedFailure({
+            target: this._targetLabel(),
+            bytes: script.length,
+            attempts: refused,
+          }).message,
+        }
+      }
       if (!outcome.ok) {
         if (looksLikeDialectMismatch(outcome.result.error)) this.invalidateProfile()
       } else if (outcome.result.exitCode !== 0 && looksLikeDialectMismatch(outcome.result.stderr?.text)) {
@@ -854,12 +1004,12 @@ export class SshClient {
       let settled = false
       let timer
       let stream = null
-      const finish = (result, { healthy = true, presend = false } = {}) => {
+      const finish = (result, { healthy = true, presend = false, refused = false } = {}) => {
         if (settled) return
         settled = true
         if (timer !== undefined) clearTimeout(timer)
         conn.removeListener('error', onConnError)
-        resolve({ ok: result.ok, presend, healthy, result })
+        resolve({ ok: result.ok, presend, healthy, refused, result })
       }
       const onConnError = (error) => {
         finish({ ok: false, error: describe(error) }, { healthy: false, presend: stream === null })
@@ -874,8 +1024,10 @@ export class SshClient {
         conn.exec(command, (err, s) => {
           if (settled) return
           if (err) {
-            // exec failed before a channel existed -> the command never ran.
-            finish({ ok: false, error: describe(err) }, { healthy: false, presend: true })
+            // exec failed before a channel existed -> the command never ran. A
+            // remote-REFUSED exec request (CHANNEL_FAILURE) is flagged so the
+            // caller retries with a byte-varied payload instead of the same one.
+            finish({ ok: false, error: describe(err) }, { healthy: false, presend: true, refused: isExecRequestRefused(err) })
             return
           }
           stream = s
@@ -927,14 +1079,14 @@ export class SshClient {
           }).catch(() => {})
         })
       }
-      const finish = (result, { healthy = true, presend = false } = {}) => {
+      const finish = (result, { healthy = true, presend = false, refused = false } = {}) => {
         if (settled) return
         settled = true
         if (timer !== undefined) clearTimeout(timer)
         clearTimeout(pidTimer)
         if (signal !== undefined) signal.removeEventListener('abort', onAbort)
         conn.removeListener('error', onConnError)
-        resolve({ ok: result.ok, presend, healthy, result })
+        resolve({ ok: result.ok, presend, healthy, refused, result })
       }
       const onConnError = (error) => {
         finish({ ok: false, error: this._agentError(error) }, { healthy: false, presend: stream === null })
@@ -970,8 +1122,10 @@ export class SshClient {
         conn.exec(script, (err, s) => {
           if (settled) return
           if (err) {
-            // exec failed before a channel existed -> the command never ran.
-            finish({ ok: false, error: this._agentError(err) }, { healthy: false, presend: true })
+            // exec failed before a channel existed -> the command never ran. A
+            // remote-REFUSED exec request (CHANNEL_FAILURE) is flagged so the
+            // caller retries with a byte-varied payload instead of the same one.
+            finish({ ok: false, error: this._agentError(err) }, { healthy: false, presend: true, refused: isExecRequestRefused(err) })
             return
           }
           stream = s
