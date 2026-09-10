@@ -24,7 +24,7 @@
   "scripts": {
     "build:client": "node scripts/build-client.mjs",
     "prepack": "node scripts/build-client.mjs",
-    "test": "node test/unit-anchor-path.mjs && node test/unit-secrets-encryption.mjs && node test/unit-fs.mjs && node test/unit-shell.mjs && node test/unit-routing.mjs && node test/unit-remote-policy.mjs && node test/unit-search-registration.mjs && node test/unit-win-remote.mjs && node test/unit-registry-os.mjs && node test/unit-local-browse.mjs && node test/unit-shell-sessions.mjs && node test/unit-execstream-pool.mjs && node test/unit-profile-cache.mjs",
+    "test": "node test/unit-anchor-path.mjs && node test/unit-secrets-encryption.mjs && node test/unit-fs.mjs && node test/unit-shell.mjs && node test/unit-routing.mjs && node test/unit-remote-policy.mjs && node test/unit-search-registration.mjs && node test/unit-win-remote.mjs && node test/unit-registry-os.mjs && node test/unit-local-browse.mjs && node test/unit-shell-sessions.mjs && node test/unit-execstream-pool.mjs && node test/unit-profile-cache.mjs && node test/unit-connection-errors.mjs",
     "test:integration": "node test/integration-remote.mjs"
   },
   "dependencies": {

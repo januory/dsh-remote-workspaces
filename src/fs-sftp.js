@@ -52,7 +52,9 @@ export class SftpBackend {
       this._sftp = undefined
     }
     if (this._opening === undefined) {
-      this._opening = this.client.sftp()
+      // Agent-facing: this channel is opened by the file tools and the agent
+      // loop, whose error text must be English (and carry the target/stage).
+      this._opening = this.client.sftp({ agentFacing: true })
         .then((facade) => { this._sftp = facade; return facade })
         .finally(() => { this._opening = undefined })
     }

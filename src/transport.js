@@ -323,6 +323,30 @@ function describeErrorEn(error) {
   return message
 }
 
+/** Stage labels for a failed remote channel open, per audience. */
+const CHANNEL_STAGE_USER = { connect: '连接', handshake: '握手', subsystem: 'SFTP 子系统', shell: 'shell 通道' }
+
+/**
+ * Message for a remote CHANNEL open that failed (the SFTP subsystem or an
+ * interactive shell), carrying the target and the stage it died at.
+ *
+ * Same audience rule as the rest of the transport: `agentFacing` is English
+ * because the model reads it (the file tools and the agent loop open channels
+ * through here), the default is the Chinese text the settings card and the
+ * Shell tab show the USER. The stage is the diagnostic that was missing when a
+ * killed sshd listener surfaced as a bare "SFTP 连接超时": `connect` means the
+ * TCP/SSH connection never came up, `handshake` means it was accepted but the
+ * SSH handshake stalled, `subsystem`/`shell` means the authenticated connection
+ * refused the channel itself.
+ */
+function channelOpenMessage({ what, agentFacing, timedOut, stage, target, cause }) {
+  const detail = timedOut || cause === undefined || cause === '' ? '' : `: ${cause}`
+  if (agentFacing) {
+    return `${what} connection ${timedOut ? 'timed out' : 'failed'} (target: ${target}, stage: ${stage})${detail}`
+  }
+  return `${what} 连接${timedOut ? '超时' : '失败'}（目标：${target}，阶段：${CHANNEL_STAGE_USER[stage] ?? stage}）${detail}`
+}
+
 /**
  * Signatures of a command that failed because the SCRIPT DIALECT did not match
  * the host — i.e. the cached remote profile went stale because the host's
@@ -468,6 +492,20 @@ export class SshClient {
     this._os = undefined
   }
 
+  /** `user@host:port`, for diagnostics in connection-failure messages. */
+  _targetLabel() {
+    return `${this.user ? `${this.user}@` : ''}${this.host}:${Number(this.port) || 22}`
+  }
+
+  /**
+   * Agent-facing (English) connection-error text, tagged with the target — the
+   * model triages from this, and a bare "connection timed out" never said
+   * WHICH host or WHICH stage died.
+   */
+  _agentError(error) {
+    return `${describeErrorEn(error)} (target: ${this._targetLabel()})`
+  }
+
   connectConfig() {
     const config = {
       host: this.host,
@@ -512,13 +550,18 @@ export class SshClient {
     const started = Date.now()
     const deadline = timeoutMs ?? this.timeoutMs
     const describe = agentFacing ? describeErrorEn : describeError
+    // The agent-facing wording carries the target too (see `_agentError`).
+    const describeFor = (error) => {
+      const text = describe(error)
+      return agentFacing ? `${text} (target: ${this._targetLabel()})` : text
+    }
     for (let attempt = 0; ; attempt++) {
       let lease
       try {
         lease = await this._acquireExec()
       } catch (error) {
         if (attempt === 0) { await sleepMs(RETRY_DELAY_MS); continue }
-        return { ok: false, ms: Date.now() - started, error: describe(error) }
+        return { ok: false, ms: Date.now() - started, error: describeFor(error) }
       }
       const outcome = await this._execOnLease(lease, {
         command,
@@ -532,6 +575,9 @@ export class SshClient {
         continue
       }
       const result = { ...outcome.result, ms: Date.now() - started }
+      if (!result.ok && agentFacing && typeof result.error === 'string' && result.error !== '') {
+        result.error = `${result.error} (target: ${this._targetLabel()})`
+      }
       if (!result.ok && (looksLikeDialectMismatch(result.error) || looksLikeDialectMismatch(result.stderr))) {
         this.invalidateProfile()
       }
@@ -567,7 +613,7 @@ export class SshClient {
         lease = await this._acquireExec()
       } catch (error) {
         if (attempt === 0) { await sleepMs(RETRY_DELAY_MS); continue }
-        return { ok: false, error: describeErrorEn(error) }
+        return { ok: false, error: this._agentError(error) }
       }
       const outcome = await this._execShellOnLease(lease, {
         script,
@@ -771,7 +817,7 @@ export class SshClient {
         resolve({ ok: result.ok, presend, healthy, result })
       }
       const onConnError = (error) => {
-        finish({ ok: false, error: describeErrorEn(error) }, { healthy: false, presend: stream === null })
+        finish({ ok: false, error: this._agentError(error) }, { healthy: false, presend: stream === null })
       }
       const onAbort = () => {
         aborting = true
@@ -803,7 +849,7 @@ export class SshClient {
           if (settled) return
           if (err) {
             // exec failed before a channel existed -> the command never ran.
-            finish({ ok: false, error: describeErrorEn(err) }, { healthy: false, presend: true })
+            finish({ ok: false, error: this._agentError(err) }, { healthy: false, presend: true })
             return
           }
           stream = s
@@ -832,7 +878,7 @@ export class SshClient {
           else s.end(String(stdin))
         })
       } catch (error) {
-        finish({ ok: false, error: describeErrorEn(error) }, { healthy: false, presend: true })
+        finish({ ok: false, error: this._agentError(error) }, { healthy: false, presend: true })
       }
     })
   }
@@ -841,18 +887,32 @@ export class SshClient {
    * Open an SFTP channel and resolve a promise-wrapped facade over it.
    * Resolves `{ conn, readdir, stat, readFile, writeFile, mkdir, unlink, realpath, end }`.
    */
-  sftp() {
+  sftp({ agentFacing = false } = {}) {
     return new Promise((resolve, reject) => {
       const conn = new Client()
       let settled = false
+      let timedOut = false
+      let stage = 'connect'
       const fail = (error) => {
         if (settled) return
         settled = true
         try { conn.end() } catch {}
-        reject(error instanceof Error ? error : new Error(String(error)))
+        const cause = error instanceof Error ? error.message : String(error)
+        const wrapped = new Error(channelOpenMessage({
+          what: 'SFTP',
+          agentFacing,
+          timedOut,
+          stage,
+          target: this._targetLabel(),
+          cause: timedOut ? undefined : cause,
+        }))
+        if (error !== undefined && error !== null && error.code !== undefined) wrapped.code = error.code
+        reject(wrapped)
       }
-      const timer = setTimeout(() => fail(new Error('SFTP 连接超时')), this.readyTimeoutMs)
+      const timer = setTimeout(() => { timedOut = true; fail(new Error('timeout')) }, this.readyTimeoutMs)
+      conn.on('connect', () => { stage = 'handshake' })
       conn.on('ready', () => {
+        stage = 'subsystem'
         conn.sftp((err, sftp) => {
           if (err) { clearTimeout(timer); fail(err); return }
           clearTimeout(timer)
@@ -919,14 +979,28 @@ export class SshClient {
     return chdirPromise.then((chdir) => new Promise((resolve, reject) => {
       const conn = new Client()
       let settled = false
+      let timedOut = false
+      let stage = 'connect'
       const fail = (error) => {
         if (settled) return
         settled = true
         try { conn.end() } catch {}
-        reject(error instanceof Error ? error : new Error(String(error)))
+        const cause = error instanceof Error ? error.message : String(error)
+        const wrapped = new Error(channelOpenMessage({
+          what: 'SSH shell',
+          agentFacing: false,
+          timedOut,
+          stage,
+          target: this._targetLabel(),
+          cause: timedOut ? undefined : cause,
+        }))
+        if (error !== undefined && error !== null && error.code !== undefined) wrapped.code = error.code
+        reject(wrapped)
       }
-      const timer = setTimeout(() => fail(new Error('SSH shell 连接超时')), this.readyTimeoutMs)
+      const timer = setTimeout(() => { timedOut = true; fail(new Error('timeout')) }, this.readyTimeoutMs)
+      conn.on('connect', () => { stage = 'handshake' })
       conn.on('ready', () => {
+        stage = 'shell'
         conn.shell({ term, rows, cols, ...(env ? { env } : {}) }, (err, stream) => {
           if (err) { clearTimeout(timer); fail(err); return }
           clearTimeout(timer)
@@ -995,7 +1069,7 @@ export class SshClient {
       return {
         readOut: () => ({ delta: '', lossy: false }),
         readErr: () => ({ delta: '', lossy: false }),
-        exit: Promise.resolve({ error: describeErrorEn(error) }),
+        exit: Promise.resolve({ error: this._agentError(error) }),
         terminate() {},
       }
     }
@@ -1030,11 +1104,11 @@ export class SshClient {
         release(healthy)
         exitResolve(value)
       }
-      const onConnError = (connError) => finish({ error: describeErrorEn(connError) }, { healthy: false })
+      const onConnError = (connError) => finish({ error: this._agentError(connError) }, { healthy: false })
       // A silent connection close (server dropped us without a DISCONNECT
       // packet) emits no 'error'; without this a long-lived job would never
       // settle — there is no channel timeout on a background job.
-      const onConnClose = () => finish({ error: 'connection closed unexpectedly' }, { healthy: false })
+      const onConnClose = () => finish({ error: this._agentError(new Error('connection closed unexpectedly')) }, { healthy: false })
       conn.on('error', onConnError)
       conn.on('close', onConnClose)
       const push = (target) => (chunk) => {
@@ -1096,7 +1170,7 @@ export class SshClient {
       try {
         conn.exec(script, (execError, s) => {
           if (settled) return
-          if (execError) { finish({ error: describeErrorEn(execError) }, { healthy: false }); return }
+          if (execError) { finish({ error: this._agentError(execError) }, { healthy: false }); return }
           stream = s
           s.on('data', onOut)
           s.stderr.on('data', onErr)
@@ -1109,7 +1183,7 @@ export class SshClient {
           s.end()
         })
       } catch (error) {
-        finish({ error: describeErrorEn(error) }, { healthy: false })
+        finish({ error: this._agentError(error) }, { healthy: false })
       }
       resolve({
         readOut: reader(out),
