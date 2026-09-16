@@ -29,17 +29,23 @@ var React = require('react')
 
 // ---------------------------------------------------------------------------
 // Remote contract (must match src/index.js). Parameters carry strict codecs
-// with a pass-through `parse` (the client `$mount` face rejects `src-json`).
+// whose `create()` factory yields a pass-through `parse` (the client `$mount`
+// face rejects `src-json`).
 // ---------------------------------------------------------------------------
 var PACKAGE = 'dsh-remote-workspaces'
 var NAMESPACE = 'remoteWorkspaces'
 
+// A strict codec must carry a `create()` factory (the client `$mount` face
+// rejects `src-json`, and the Typert registry rejects a strict codec without a
+// factory), so it materializes a pass-through JSON schema on demand.
+var JSON_SCHEMA = Object.freeze({
+  parse: function (value) { return value },
+})
+
 var JSON_CODEC = Object.freeze({
   mode: 'strict',
   typeSymbol: 'JsonValue',
-  schema: Object.freeze({
-    parse: function (value) { return value },
-  }),
+  create: function () { return JSON_SCHEMA },
 })
 
 function jsonParameter(name) {
