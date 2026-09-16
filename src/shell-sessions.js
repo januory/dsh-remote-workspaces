@@ -90,7 +90,7 @@ export function createShellSessions({ getSubprocess, openRemote: openRemoteChann
       // now covered — start incremental reads fresh to avoid double replay.
       existing.unread.chunks.length = 0
       existing.unread.bytes = 0
-      return { id: existing.id, pid: existing.handle.pid, kind: 'local', attached: true, history }
+      return { id: existing.id, pid: existing.handle.pid, kind: 'local', shell: existing.meta.shell, attached: true, history }
     }
     const subprocess = getSubprocess()
     if (subprocess === undefined || typeof subprocess.spawnTerminal !== 'function') {
@@ -102,8 +102,9 @@ export function createShellSessions({ getSubprocess, openRemote: openRemoteChann
     const rows = Number.isInteger(opts.rows) && opts.rows > 0 ? opts.rows : 24
     const cols = Number.isInteger(opts.cols) && opts.cols > 0 ? opts.cols : 80
     const handle = await subprocess.spawnTerminal({ argv, cwd, rows, cols, graceMs: 3000 })
-    const session = register(handle, { kind: 'local', label: win ? 'PowerShell' : 'bash' }, key)
-    return { id: session.id, pid: handle.pid, kind: 'local', attached: false }
+    const shell = win ? 'PowerShell' : 'bash'
+    const session = register(handle, { kind: 'local', label: '本机', shell }, key)
+    return { id: session.id, pid: handle.pid, kind: 'local', shell, attached: false }
   }
 
   async function openRemote(machine, opts = {}) {
@@ -113,7 +114,7 @@ export function createShellSessions({ getSubprocess, openRemote: openRemoteChann
       const history = historyText(existing)
       existing.unread.chunks.length = 0
       existing.unread.bytes = 0
-      return { id: existing.id, pid: null, kind: 'remote', attached: true, history }
+      return { id: existing.id, pid: null, kind: 'remote', shell: existing.meta.shell, attached: true, history }
     }
     if (typeof openRemoteChannel !== 'function') throw new Error('remote shell unavailable (no openShell)')
     const rows = Number.isInteger(opts.rows) && opts.rows > 0 ? opts.rows : 24
@@ -123,8 +124,12 @@ export function createShellSessions({ getSubprocess, openRemote: openRemoteChann
     const session = register(handle, {
       kind: 'remote',
       label: (machine && (machine.alias || machine.host)) || 'remote',
+      // The login shell the SSH channel actually started (`bash`, `zsh`,
+      // `PowerShell`, `cmd`…), exposed by SshClient.openShell from the cached
+      // remote profile. Undefined when the probe failed — the UI then hides it.
+      shell: handle.shellName,
     }, key)
-    return { id: session.id, pid: null, kind: 'remote', attached: false }
+    return { id: session.id, pid: null, kind: 'remote', shell: session.meta.shell, attached: false }
   }
 
   function requireSession(id) {
@@ -172,6 +177,7 @@ export function createShellSessions({ getSubprocess, openRemote: openRemoteChann
       pid: session.handle.pid ?? null,
       kind: session.meta.kind,
       label: session.meta.label,
+      shell: session.meta.shell,
       ended: session.ended,
     }))
   }

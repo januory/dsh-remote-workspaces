@@ -68,6 +68,11 @@ await build({
 const React = {
   Fragment: Symbol('react.fragment'),
   createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+  // Minimal hooks: ShellTitle subscribes to the live shell-label store through
+  // useState/useEffect. The store is empty in this offline test, so the chip
+  // falls back to the captured title — asserted below.
+  useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
+  useEffect: () => {},
 }
 let loaded = null
 const windowStub = { __ModuleLoader__: { load: (def) => { loaded = def } } }
@@ -112,21 +117,23 @@ const shellTitle = registrations.find((r) => r.spec.name === 'sidebar.right.pane
 check('the Shell body registers into sidebar.right.pane.tab', shellBody !== undefined, registrations.map((r) => `${r.spec.name}:${r.spec.key}`).join(' | '))
 check('the Shell chip title registers into sidebar.right.pane.tab.title', shellTitle !== undefined, JSON.stringify(shellTitle === undefined ? null : shellTitle.spec))
 check('both seats use the SAME type id (the seat dispatches on it, not on the kind)', shellBody !== undefined && shellTitle !== undefined)
+check('the chip title seat injects getSessionId (keys the live shell label)',
+  typeof shellTitle.spec.inject === 'function' && typeof shellTitle.spec.inject().getSessionId === 'function')
 
 // --- the title really draws a glyph before the live label -------------------
 // One element→component pass, the way React resolves a function component
-// before painting it (the components under test hold no hooks, so once is
-// enough). Without this the fake `createElement` would hand back the component
-// itself instead of the `<svg>` it returns.
+// before painting it (the fake React returns hook values without re-rendering,
+// so one pass is enough). Without this the fake `createElement` would hand back
+// the component itself instead of the `<svg>` it returns.
 const render = (node) => (node && typeof node.type === 'function' ? node.type(node.props) : node)
-const title = shellTitle.component({ useTabInfo: () => ({ tab: { title: 'RW终端', id: 'tab-1' } }) })
+const title = shellTitle.component({ useTabInfo: () => ({ tab: { title: 'RW终端', id: 'tab-1' } }), getSessionId: () => 'sess-1' })
 check('the chip title renders the terminal glyph and the tab label', title.type === React.Fragment && title.children.length === 2, JSON.stringify(title.children.map((c) => (typeof c === 'string' ? c : typeof c.type))))
 const glyph = render(title.children[0])
 check('the glyph is an inline svg', glyph.type === 'svg' && glyph.props.width === 16 && glyph.props.height === 16, JSON.stringify({ type: glyph.type, width: glyph.props.width }))
 check('the glyph draws on currentColor at the strip\'s ink', glyph.props.stroke === 'currentColor' && glyph.props.fill === 'none', JSON.stringify({ stroke: glyph.props.stroke, fill: glyph.props.fill }))
 check('the glyph is a fixed-width flex child (the strip spaces it)', glyph.props.style && glyph.props.style.flex === 'none', JSON.stringify(glyph.props.style))
 check('the label is the tab title captured by the registry', title.children[1] === 'RW终端', JSON.stringify(title.children[1]))
-const fallback = shellTitle.component({ useTabInfo: () => ({ tab: {} }) })
+const fallback = shellTitle.component({ useTabInfo: () => ({ tab: {} }), getSessionId: () => 'sess-1' })
 check('a tab record without a title still shows the type label', fallback.children[1] === 'RW终端', JSON.stringify(fallback.children[1]))
 
 rmSync(scratch, { recursive: true, force: true })

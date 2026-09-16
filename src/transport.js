@@ -118,14 +118,33 @@ const PS_EXIT_GLUE = 'if ($?) { exit $LASTEXITCODE } else { exit 1 }'
 /**
  * Remote execution profiles, probed once per target and cached for the
  * process lifetime:
- *   { family: 'posix',  os: 'linux'|'darwin', shell: 'posix' }
- *   { family: 'windows', os: 'windows', shell: 'powershell'|'cmd' }
+ *   { family: 'posix',  os: 'linux'|'darwin', shell: 'posix', shellName: 'bash'|'zsh'|… }
+ *   { family: 'windows', os: 'windows', shell: 'powershell'|'cmd', shellName: 'PowerShell'|'cmd' }
  *   { family: 'unknown', … } — callers fall back to POSIX behaviour.
+ *
+ * `shellName` is the login shell's own name for display (the UI's terminal tab
+ * title); `shell` stays the exec dialect every command builder switches on.
  */
 const REMOTE_PROFILE_CACHE = new Map()
 
 export function profileCacheKey({ host, user, port }) {
   return `${user ?? ''}@${host ?? ''}:${port ?? 22}`
+}
+
+/**
+ * The POSIX login shell's own name. sshd sets `SHELL` from the account's passwd
+ * entry, and POSIX parameter expansion strips the leading path without needing
+ * an external `basename` (`/bin/bash` -> `bash`, `/usr/bin/zsh` -> `zsh`).
+ * Best-effort: an empty, failed or unexpected probe yields `sh`, the POSIX
+ * fallback, rather than failing the whole profile.
+ */
+async function probePosixShellName(client) {
+  try {
+    const res = await client.run('printf %s "${SHELL##*/}"')
+    const name = res.ok ? (res.stdout ?? '').trim() : ''
+    if (/^[A-Za-z0-9._-]+$/.test(name)) return name
+  } catch { /* fall through to the POSIX fallback */ }
+  return 'sh'
 }
 
 /**
@@ -144,19 +163,24 @@ export async function probeRemoteProfile(client) {
   const uname = await client.run('uname -s')
   if (uname.ok) {
     const os = (uname.stdout ?? '').trim().toLowerCase()
-    return { family: 'posix', os: os.startsWith('darwin') ? 'darwin' : 'linux', shell: 'posix' }
+    return {
+      family: 'posix',
+      os: os.startsWith('darwin') ? 'darwin' : 'linux',
+      shell: 'posix',
+      shellName: await probePosixShellName(client),
+    }
   }
   const ver = await client.run('ver')
-  if (ver.ok) return { family: 'windows', os: 'windows', shell: 'cmd' }
+  if (ver.ok) return { family: 'windows', os: 'windows', shell: 'cmd', shellName: 'cmd' }
   const nested = await client.run('cmd /c "ver"')
   if (nested.ok && /windows/i.test(nested.stdout ?? '')) {
     const ps = await client.run('$PSVersionTable.PSVersion.ToString()')
     return ps.ok
-      ? { family: 'windows', os: 'windows', shell: 'powershell' }
-      : { family: 'windows', os: 'windows', shell: 'cmd' }
+      ? { family: 'windows', os: 'windows', shell: 'powershell', shellName: 'PowerShell' }
+      : { family: 'windows', os: 'windows', shell: 'cmd', shellName: 'cmd' }
   }
   const ps = await client.run('$PSVersionTable.PSVersion.ToString()')
-  if (ps.ok) return { family: 'windows', os: 'windows', shell: 'powershell' }
+  if (ps.ok) return { family: 'windows', os: 'windows', shell: 'powershell', shellName: 'PowerShell' }
   return { family: 'unknown', os: 'unknown', shell: 'unknown' }
 }
 
@@ -1283,10 +1307,17 @@ export class SshClient {
    *   `terminate` closes the channel then ends the connection.
    */
   openShell({ rows = 24, cols = 80, term = 'xterm-256color', env, cwd } = {}) {
-    const chdirPromise = cwd !== undefined && cwd !== null && cwd !== ''
-      ? this.profile().then((profile) => shellCdCommand(profile, cwd)).catch(() => '')
-      : Promise.resolve('')
-    return chdirPromise.then((chdir) => new Promise((resolve, reject) => {
+    // The profile is resolved unconditionally: it supplies the `cd` glue for a
+    // requested cwd AND the login shell's own name, which the UI shows as the
+    // terminal tab's title. Probes are cached per target, so after the target's
+    // first command this is a lookup.
+    const context = this.profile()
+      .then((profile) => ({
+        chdir: cwd !== undefined && cwd !== null && cwd !== '' ? shellCdCommand(profile, cwd) : '',
+        shellName: profile.shellName,
+      }))
+      .catch(() => ({ chdir: '', shellName: undefined }))
+    return context.then(({ chdir, shellName }) => new Promise((resolve, reject) => {
       const conn = new Client()
       let settled = false
       let timedOut = false
@@ -1321,6 +1352,7 @@ export class SshClient {
           resolve({
             output: stream,
             pid: null,
+            shellName,
             write(data) { if (!closed) { try { stream.write(data) } catch {} } },
             terminate() { try { stream.close() } catch {} try { conn.end() } catch {} },
             resize(r, c) { if (!closed) { try { stream.setWindow(r, c) } catch {} } },

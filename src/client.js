@@ -12,7 +12,9 @@
  *
  * 3. A "RW终端" tab type (kind `shell`, guide entry on the 开始/Start page,
  *    terminal glyph on the tab chip) whose body renders a real xterm terminal
- *    backed by a local PTY session.
+ *    backed by a local PTY session or a remote SSH shell channel. The chip's
+ *    text turns into the actual login shell (`bash`, `zsh`, `PowerShell`, `cmd`)
+ *    once the session opens, falling back to "RW终端" while it connects.
  *
  * Built by `scripts/build-client.mjs` (esbuild) into `lib/client.js`: the
  * bundle registers `window.__ModuleLoader__.load({id, factory})`, keeps `react`
@@ -981,6 +983,33 @@ function unwrapRemote(res) {
     // =========================================================================
     var shellSessionCache = {}
 
+    // Live per-tab terminal labels. The tab chip's text is captured when the tab
+    // opens (the type's `title()`), which is before anything knows which shell
+    // will actually run, so the title seat reads this store instead and flips to
+    // `bash` / `zsh` / `PowerShell` / `cmd` once the session reports it. Keyed
+    // exactly like `shellSessionCache` (session + tab id) so two sessions' shells
+    // never collide.
+    var shellTabLabels = {}
+    var shellTabLabelListeners = new Set()
+
+    function setShellTabLabel(key, shell) {
+      if (typeof key !== 'string' || key === '' || typeof shell !== 'string' || shell === '') return
+      if (shellTabLabels[key] === shell) return
+      shellTabLabels[key] = shell
+      shellTabLabelListeners.forEach(function (fn) { try { fn() } catch (e) { /* one render must not break the rest */ } })
+    }
+
+    function useShellTabLabel(key) {
+      var pair = React.useState(function () { return shellTabLabels[key] })
+      React.useEffect(function () {
+        var read = function () { pair[1](shellTabLabels[key]) }
+        shellTabLabelListeners.add(read)
+        read()
+        return function () { shellTabLabelListeners.delete(read) }
+      }, [key])
+      return pair[0]
+    }
+
     function ShellBody(props) {
       var getRemote = props.getRemote
       var getCwd = props.getCwd
@@ -1076,6 +1105,7 @@ function unwrapRemote(res) {
             // Re-attaching to a kept-alive session: show connected at once,
             // and the full scrollback replays when the attach resolves below.
             setLabel(cached.label || '本机')
+            setShellTabLabel(key, cached.shell)
             setStatus('open')
           }
           var opts = { rows: term.rows, cols: term.cols, key: key }
@@ -1095,8 +1125,9 @@ function unwrapRemote(res) {
               sessionRef.current = b.id
               kindRef.current = b.kind || null
               setLabel(b.label || (b.kind === 'remote' ? '远程' : '本机'))
+              setShellTabLabel(key, b.shell)
               setStatus('open')
-              shellSessionCache[key] = { id: b.id, kind: b.kind || null, label: b.label || (b.kind === 'remote' ? '远程' : '本机') }
+              shellSessionCache[key] = { id: b.id, kind: b.kind || null, label: b.label || (b.kind === 'remote' ? '远程' : '本机'), shell: b.shell || null }
               timerRef.current = setTimeout(tick, 60)
             },
             function (e) {
@@ -1198,6 +1229,7 @@ function unwrapRemote(res) {
           var removed = tabSignal ? tabSignal.aborted : true
           if (id && ns && removed) {
             delete shellSessionCache[key]
+            delete shellTabLabels[key]
             ns.shellClose(id)
           }
           if (termRef.current) { try { termRef.current.dispose() } catch (e2) { /* noop */ } }
@@ -1257,15 +1289,19 @@ function unwrapRemote(res) {
     // The type's chip title: the same terminal glyph before the label, mirroring
     // the files type's folder sheet. The tab strip's title row is a flex row with
     // a 5px gap that centres a leading glyph, so the glyph is one more child with
-    // `flex:none` — no wrapper of our own. Without this registration the chip
-    // shows only the `title()` text captured when the tab opened; reading it back
-    // through `useTabInfo` keeps a future live title (the shell's own name)
-    // working without touching this seat.
+    // `flex:none` — no wrapper of our own. The label prefers the LIVE shell name
+    // reported by the tab's own session (`shellTabLabels`, e.g. `bash`), which
+    // arrives after the tab opened, and falls back to the captured `title()` and
+    // then the generic name.
     function ShellTitle(props) {
       var useTabInfo = props && props.useTabInfo
+      var getSessionId = props && props.getSessionId
       var info = null
       try { info = useTabInfo ? useTabInfo() : null } catch (e) { info = null }
-      var label = info && info.tab && info.tab.title ? info.tab.title : 'RW终端'
+      var tabId = info && info.tab ? info.tab.id : 'shell'
+      var live = useShellTabLabel((getSessionId ? getSessionId() : 's') + ':' + tabId)
+      var captured = info && info.tab && info.tab.title ? info.tab.title : 'RW终端'
+      var label = live || captured
       return React.createElement(
         React.Fragment,
         null,
@@ -1390,10 +1426,12 @@ function unwrapRemote(res) {
         )
       })
       // The chip seat, keyed by the same id as the body (that id — not the kind —
-      // is what the seat dispatches on).
+      // is what the seat dispatches on). It injects `getSessionId` because the
+      // live shell label is keyed by (session, tab), exactly like the body's
+      // shell-session key.
       ctx.slots.inject('sidebar.right.pane.tab.title', function () {
         return ctx.slots.register(
-          { name: 'sidebar.right.pane.tab.title', key: SHELL_ID },
+          { name: 'sidebar.right.pane.tab.title', key: SHELL_ID, inject: function () { return { getSessionId: getSessionId } } },
           ShellTitle,
         )
       })

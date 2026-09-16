@@ -74,20 +74,39 @@ check('psQuote escapes apostrophe', psQuote("it's") === `'it''s'`)
 
   const posix = await probe({ 'uname -s': { ok: true, stdout: 'Linux' } })
   check('probe posix linux', posix.family === 'posix' && posix.os === 'linux' && posix.shell === 'posix')
+  check('posix shell name falls back to sh when the probe fails', posix.shellName === 'sh', JSON.stringify(posix.shellName))
+  const posixBash = await probe({
+    'uname -s': { ok: true, stdout: 'Linux' },
+    'printf %s "${SHELL##*/}"': { ok: true, stdout: 'bash' },
+  })
+  check('posix shell name is read from $SHELL', posixBash.shellName === 'bash', JSON.stringify(posixBash.shellName))
+  const posixZsh = await probe({
+    'uname -s': { ok: true, stdout: 'Linux' },
+    'printf %s "${SHELL##*/}"': { ok: true, stdout: 'zsh\n' },
+  })
+  check('posix shell name trims probe whitespace', posixZsh.shellName === 'zsh', JSON.stringify(posixZsh.shellName))
+  const posixJunk = await probe({
+    'uname -s': { ok: true, stdout: 'Linux' },
+    'printf %s "${SHELL##*/}"': { ok: true, stdout: '/usr/bin/fish\r\n' },
+  })
+  check('posix shell name rejects a path-y probe answer', posixJunk.shellName === 'sh', JSON.stringify(posixJunk.shellName))
   const darwin = await probe({ 'uname -s': { ok: true, stdout: 'Darwin' } })
   check('probe posix darwin', darwin.family === 'posix' && darwin.os === 'darwin')
   const winCmd = await probe({ 'ver': { ok: true, stdout: 'Microsoft Windows [Version 10.0.20348]' } })
   check('probe windows/cmd via bare ver', winCmd.family === 'windows' && winCmd.shell === 'cmd', JSON.stringify(winCmd))
+  check('windows/cmd names the shell', winCmd.shellName === 'cmd', JSON.stringify(winCmd.shellName))
   const winPs = await probe({
     'ver': { ok: false, exitCode: 1 },
     'cmd /c "ver"': { ok: true, stdout: 'Microsoft Windows [Version 10.0.26200]' },
     '$PSVersionTable.PSVersion.ToString()': { ok: true, stdout: '5.1' },
   })
   check('probe windows/powershell via cmd /c "ver" + PSVersionTable', winPs.family === 'windows' && winPs.shell === 'powershell', JSON.stringify(winPs))
+  check('windows/powershell names the shell', winPs.shellName === 'PowerShell', JSON.stringify(winPs.shellName))
   const winPsNoCmd = await probe({ '$PSVersionTable.PSVersion.ToString()': { ok: true, stdout: '7.4' } })
   check('probe windows/powershell when cmd is absent', winPsNoCmd.family === 'windows' && winPsNoCmd.shell === 'powershell', JSON.stringify(winPsNoCmd))
   const unk = await probe({})
   check('probe unknown when every step fails', unk.family === 'unknown' && unk.shell === 'unknown')
+  check('an unknown profile names no shell', unk.shellName === undefined)
 }
 
 {

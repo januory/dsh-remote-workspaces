@@ -43,7 +43,7 @@ const shells = createShellSessions({
   }),
   openRemote: async (machine, opts) => {
     remoteArgs = { machine, opts }
-    remoteHandle = fakeHandle(999)
+    remoteHandle = Object.assign(fakeHandle(999), { shellName: 'zsh' })
     return remoteHandle
   },
 })
@@ -54,6 +54,7 @@ const shells = createShellSessions({
 const local = await shells.openLocal({ rows: 30, cols: 100 })
 const handle1 = localHandle
 check('openLocal returns id/pid/kind', Boolean(local.id) && local.pid === 12345 && local.kind === 'local', JSON.stringify(local))
+check('openLocal names the local shell', local.shell === (process.platform === 'win32' ? 'PowerShell' : 'bash'), JSON.stringify(local.shell))
 check('spawnTerminal got rows/cols', spawnSpecs[0].rows === 30 && spawnSpecs[0].cols === 100, JSON.stringify({ rows: spawnSpecs[0].rows, cols: spawnSpecs[0].cols }))
 check('spawnTerminal argv non-empty', Array.isArray(spawnSpecs[0].argv) && spawnSpecs[0].argv.length > 0, JSON.stringify(spawnSpecs[0].argv))
 
@@ -87,6 +88,7 @@ check('write after eof is dropped', localHandle.calls.writes.length === 0, `writ
 const machine = { id: 'm1', alias: 'dev', host: '10.0.0.2', user: 'u' }
 const remote = await shells.openRemote(machine, { rows: 25, cols: 90 })
 check('openRemote returns id/pid=null/kind', Boolean(remote.id) && remote.pid === null && remote.kind === 'remote', JSON.stringify(remote))
+check('openRemote carries the login shell name from the channel handle', remote.shell === 'zsh', JSON.stringify(remote.shell))
 check('openRemote forwards machine + opts', remoteArgs.machine === machine && remoteArgs.opts.rows === 25 && remoteArgs.opts.cols === 90)
 check('remote resize uses setWindow', (await shells.resize(remote.id, 50, 130)).resized === true && remoteHandle.calls.resizes[0][0] === 50)
 
@@ -96,6 +98,7 @@ check('remote resize uses setWindow', (await shells.resize(remote.id, 50, 130)).
 const before = shells.list()
 check('list shows local + remote sessions', before.length === 3, JSON.stringify(before.map((s) => s.kind)))
 check('list labels remote by alias', before.some((s) => s.kind === 'remote' && s.label === 'dev'))
+check('list exposes each session\'s shell name', before.some((s) => s.kind === 'remote' && s.shell === 'zsh') && before.some((s) => s.kind === 'local' && s.shell === (process.platform === 'win32' ? 'PowerShell' : 'bash')))
 
 const closed = await shells.close(local.id)
 check('close terminates + removes', closed.closed === true && handle1.calls.terminated === true)
@@ -120,6 +123,7 @@ check('openRemote without backend throws', threw === true)
   const r1 = await shells.openRemote(machine, { key: 'attach-r1' })
   const r1again = await shells.openRemote(machine, { key: 'attach-r1' })
   check('remote attach reuses the same session id', r1.id === r1again.id && r1again.attached === true)
+  check('remote attach keeps the shell name', r1again.shell === 'zsh', JSON.stringify(r1again.shell))
   const r2 = await shells.openRemote(machine, { key: 'attach-r2' })
   check('remote different key opens a distinct session', r2.id !== r1.id && r2.attached === false)
 }
