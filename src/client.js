@@ -1246,7 +1246,7 @@ function unwrapRemote(res) {
             status === 'open' ? label + ' · 已连接' : status === 'ended' ? label + ' · 已结束' : status === 'error' ? label + ' · 出错' : '连接中…'),
           React.createElement('button', {
             type: 'button',
-            title: '新建 Shell',
+            title: '新建 RW终端',
             onClick: function () {
               try { if (info && info.tab && info.tab.actions) info.tab.actions.openTab(info.tab.kind, { revealIfOpened: false }) } catch (e2) { /* noop */ }
             },
@@ -1403,15 +1403,20 @@ function unwrapRemote(res) {
       })
 
       // RW终端 tab type + body (real xterm terminal; S0 = local shell only).
+      // `multiple` is what makes "＋ 新建" open a SECOND terminal: without it the
+      // harness records a page type at one fixed address per pane and every open
+      // just reveals the tab already there.
       var SHELL_KIND = 'shell'
       var SHELL_ID = 'dsh-remote-workspaces/shell'
       ctx.effect(function () {
         return ctx.sidebarRightTabs.register({
           id: SHELL_ID,
           kind: SHELL_KIND,
+          multiple: true,
           priority: 'extension',
           title: function () { return 'RW终端' },
           guide: [{
+            id: SHELL_KIND,
             order: 20,
             title: function () { return 'RW终端' },
             description: function () { return '打开当前工作区的交互终端' },

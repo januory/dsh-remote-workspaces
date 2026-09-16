@@ -108,6 +108,11 @@ const SHELL_ID = 'dsh-remote-workspaces/shell'
 const shellType = tabTypes.find((t) => t.id === SHELL_ID)
 check('the Shell tab type registers under its id', shellType !== undefined, JSON.stringify(tabTypes.map((t) => t.id)))
 check('the sidebar tab label is RW终端', shellType !== undefined && shellType.title() === 'RW终端', shellType && shellType.title())
+check('the Shell tab type creates independent content per open (＋ 新建 works)',
+  shellType !== undefined && shellType.multiple === true, shellType && String(shellType.multiple))
+check('the guide entry carries an id (the registry requires one per provider)',
+  shellType !== undefined && typeof shellType.guide[0].id === 'string' && shellType.guide[0].id !== '',
+  JSON.stringify(shellType === undefined ? null : shellType.guide[0].id))
 check('the 开始-page guide entry is RW终端 + the unchanged description',
   shellType !== undefined && shellType.guide[0].title() === 'RW终端'
   && shellType.guide[0].description() === '打开当前工作区的交互终端',
