@@ -10,7 +10,7 @@
  *    `sidebar.workspaces.directoryFlow`) at a lower priority so it shadows the
  *    native chooser and offers BOTH "本地文件夹" and "远程目录".
  *
- * 3. A "Shell" tab type (kind `shell`, guide entry on the 开始/Start page,
+ * 3. A "RW终端" tab type (kind `shell`, guide entry on the 开始/Start page,
  *    terminal glyph on the tab chip) whose body renders a real xterm terminal
  *    backed by a local PTY session.
  *
@@ -1265,7 +1265,7 @@ function unwrapRemote(res) {
       var useTabInfo = props && props.useTabInfo
       var info = null
       try { info = useTabInfo ? useTabInfo() : null } catch (e) { info = null }
-      var label = info && info.tab && info.tab.title ? info.tab.title : 'Shell'
+      var label = info && info.tab && info.tab.title ? info.tab.title : 'RW终端'
       return React.createElement(
         React.Fragment,
         null,
@@ -1366,7 +1366,7 @@ function unwrapRemote(res) {
         )
       })
 
-      // Shell tab type + body (real xterm terminal; S0 = local shell only).
+      // RW终端 tab type + body (real xterm terminal; S0 = local shell only).
       var SHELL_KIND = 'shell'
       var SHELL_ID = 'dsh-remote-workspaces/shell'
       ctx.effect(function () {
@@ -1374,10 +1374,10 @@ function unwrapRemote(res) {
           id: SHELL_ID,
           kind: SHELL_KIND,
           priority: 'extension',
-          title: function () { return 'Shell' },
+          title: function () { return 'RW终端' },
           guide: [{
             order: 20,
-            title: function () { return 'Shell' },
+            title: function () { return 'RW终端' },
             description: function () { return '打开当前工作区的交互终端' },
             icon: ShellIcon,
           }],

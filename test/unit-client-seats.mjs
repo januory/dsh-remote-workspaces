@@ -84,13 +84,14 @@ check('the client half still injects the sidebar seats', Array.isArray(plugin.in
 
 // --- run apply() against a recording context --------------------------------
 const registrations = []
+const tabTypes = []
 const disposed = []
 const ctx = {
   effect: (fn) => { const d = fn(); disposed.push(d); return () => { if (typeof d === 'function') d() } },
   get: () => undefined,
   remote: { $mount: () => ({}) },
   sessions: {},
-  sidebarRightTabs: { register: () => () => {} },
+  sidebarRightTabs: { register: (spec) => { tabTypes.push(spec); return () => {} } },
   slots: {
     inject: (_name, fn) => { fn(); return () => {} },
     register: (spec, component) => { registrations.push({ spec, component }); return () => {} },
@@ -99,6 +100,13 @@ const ctx = {
 plugin.apply(ctx)
 
 const SHELL_ID = 'dsh-remote-workspaces/shell'
+const shellType = tabTypes.find((t) => t.id === SHELL_ID)
+check('the Shell tab type registers under its id', shellType !== undefined, JSON.stringify(tabTypes.map((t) => t.id)))
+check('the sidebar tab label is RW终端', shellType !== undefined && shellType.title() === 'RW终端', shellType && shellType.title())
+check('the 开始-page guide entry is RW终端 + the unchanged description',
+  shellType !== undefined && shellType.guide[0].title() === 'RW终端'
+  && shellType.guide[0].description() === '打开当前工作区的交互终端',
+  JSON.stringify(shellType === undefined ? null : { title: shellType.guide[0].title(), description: shellType.guide[0].description() }))
 const shellBody = registrations.find((r) => r.spec.name === 'sidebar.right.pane.tab' && r.spec.key === SHELL_ID)
 const shellTitle = registrations.find((r) => r.spec.name === 'sidebar.right.pane.tab.title' && r.spec.key === SHELL_ID)
 check('the Shell body registers into sidebar.right.pane.tab', shellBody !== undefined, registrations.map((r) => `${r.spec.name}:${r.spec.key}`).join(' | '))
@@ -111,15 +119,15 @@ check('both seats use the SAME type id (the seat dispatches on it, not on the ki
 // enough). Without this the fake `createElement` would hand back the component
 // itself instead of the `<svg>` it returns.
 const render = (node) => (node && typeof node.type === 'function' ? node.type(node.props) : node)
-const title = shellTitle.component({ useTabInfo: () => ({ tab: { title: 'Shell', id: 'tab-1' } }) })
+const title = shellTitle.component({ useTabInfo: () => ({ tab: { title: 'RW终端', id: 'tab-1' } }) })
 check('the chip title renders the terminal glyph and the tab label', title.type === React.Fragment && title.children.length === 2, JSON.stringify(title.children.map((c) => (typeof c === 'string' ? c : typeof c.type))))
 const glyph = render(title.children[0])
 check('the glyph is an inline svg', glyph.type === 'svg' && glyph.props.width === 16 && glyph.props.height === 16, JSON.stringify({ type: glyph.type, width: glyph.props.width }))
 check('the glyph draws on currentColor at the strip\'s ink', glyph.props.stroke === 'currentColor' && glyph.props.fill === 'none', JSON.stringify({ stroke: glyph.props.stroke, fill: glyph.props.fill }))
 check('the glyph is a fixed-width flex child (the strip spaces it)', glyph.props.style && glyph.props.style.flex === 'none', JSON.stringify(glyph.props.style))
-check('the label is the tab title captured by the registry', title.children[1] === 'Shell', JSON.stringify(title.children[1]))
+check('the label is the tab title captured by the registry', title.children[1] === 'RW终端', JSON.stringify(title.children[1]))
 const fallback = shellTitle.component({ useTabInfo: () => ({ tab: {} }) })
-check('a tab record without a title still shows the type label', fallback.children[1] === 'Shell', JSON.stringify(fallback.children[1]))
+check('a tab record without a title still shows the type label', fallback.children[1] === 'RW终端', JSON.stringify(fallback.children[1]))
 
 rmSync(scratch, { recursive: true, force: true })
 
