@@ -92,6 +92,43 @@ function check(label, cond, detail = '') {
   rmSync(root, { recursive: true, force: true })
 }
 
+// ---- windowed byte reads (the harness's preview primitive) ----
+{
+  const root = mkdtempSync(join(tmpdir(), 'win-'))
+  const be = new LocalBackend({ cwd: root })
+  // A deterministic ramp, so a window's contents are checkable byte by byte.
+  writeFileSync(join(root, 'ramp.bin'), Buffer.from(Array.from({ length: 256 }, (_, i) => i)))
+  writeFileSync(join(root, 'text.bin'), Buffer.from('hello'))
+  const ramp = await be.resolve(join(root, 'ramp.bin'))
+  const textTarget = await be.resolve(join(root, 'text.bin'))
+
+  const window = Buffer.from(await be.readByteRange(ramp, { offset: 100, length: 4 }))
+  check('readByteRange returns the window', window.equals(Buffer.from([100, 101, 102, 103])), window.toString('hex'))
+
+  const tail = Buffer.from(await be.readByteRange(ramp, { offset: 253, length: 10 }))
+  check('readByteRange is short at the end of file', tail.equals(Buffer.from([253, 254, 255])), tail.toString('hex'))
+
+  check('readByteRange past the end is empty', (await be.readByteRange(ramp, { offset: 1000, length: 10 })).length === 0)
+  check('readByteRange length 0 is empty', (await be.readByteRange(ramp, { offset: 1, length: 0 })).length === 0)
+  check('readByteRange keeps binary bytes as-is', (await be.readByteRange(textTarget, { offset: 1, length: 3 })).length === 3)
+
+  let missing
+  try { await be.readByteRange(await be.resolve(join(root, 'nope.bin')), { offset: 0, length: 1 }) } catch (e) { missing = e && e.code }
+  check('readByteRange missing file is FS_NOT_FOUND', missing === 'FS_NOT_FOUND', String(missing))
+
+  let directory
+  try { await be.readByteRange(await be.resolve(root), { offset: 0, length: 1 }) } catch (e) { directory = e && e.code }
+  check('readByteRange on a directory is FS_NOT_REGULAR_FILE', directory === 'FS_NOT_REGULAR_FILE', String(directory))
+
+  const aborted = new AbortController()
+  aborted.abort()
+  let abortCode
+  try { await be.readByteRange(ramp, { offset: 0, length: 4 }, aborted.signal) } catch (e) { abortCode = e && e.code }
+  check('readByteRange pre-abort is FS_ABORTED', abortCode === 'FS_ABORTED', String(abortCode))
+
+  rmSync(root, { recursive: true, force: true })
+}
+
 rmSync(home, { recursive: true, force: true })
 
 const failed = results.filter((r) => !r.ok)

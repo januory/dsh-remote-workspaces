@@ -3,15 +3,17 @@
  *
  * Self-contained over `node:fs` so the plugin does not depend on the
  * `deepseek-harness` local backend (which would register `ctx.fs` and conflict
- * with the routing provider). Implements the same 12 operations as the
+ * with the routing provider). Implements the same 13 operations as the
  * `@deepseek-ai/dsh-fs` `FileSystem` seam, on plain `{ targetKey, displayPath }`
  * targets and plain version strings.
  */
 
+import { createReadStream } from 'node:fs'
 import { readFile, readdir, rename, rm, stat, lstat, realpath, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve, dirname, basename, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { fsError } from './errors.js'
+import { byteWindow } from './byte-window.js'
 import { writableRoots, isPathUnder } from './containment.js'
 
 function versionOf(st) {
@@ -110,6 +112,44 @@ export class LocalBackend {
     } catch (error) {
       throw fsError('FS_IO_ERROR', `cannot read "${target.displayPath}": ${error.message}`, error)
     }
+  }
+
+  /**
+   * Read the bytes at `[offset, offset + length)` with no decoding and no
+   * binary rejection — the windowed twin of `readBytes`. The window is the
+   * bound: the stream opens at `offset` and ends after `length` bytes, so a
+   * 100 MiB image costs a window, not the whole file. The harness's
+   * `workspace-files` byte routes (the Sidebar Files / document preview, i.e.
+   * PDF, HTML and image rendering) read through this exact method, which the
+   * `@deepseek-ai/dsh-fs` seam declares abstract — a provider without it fails
+   * with `this.ctx.fs.readByteRange is not a function` at preview time.
+   */
+  async readByteRange(target, range, signal) {
+    if (signal?.aborted) throw fsError('FS_ABORTED', `cannot read "${target.displayPath}": aborted`)
+    const info = await this.stat(target)
+    if (info === undefined) throw fsError('FS_NOT_FOUND', `cannot read "${target.displayPath}": not found`)
+    if (info.type !== 'file') throw fsError('FS_NOT_REGULAR_FILE', `cannot read "${target.displayPath}": not a regular file`)
+    const { offset, length } = byteWindow(range)
+    if (length === 0) return new Uint8Array(0)
+    const stream = createReadStream(target.targetKey, {
+      start: offset,
+      end: offset + length - 1,
+      ...(signal !== undefined ? { signal } : {}),
+    })
+    const chunks = []
+    let bytes = 0
+    try {
+      for await (const chunk of stream) {
+        chunks.push(chunk)
+        bytes += chunk.length
+      }
+    } catch (error) {
+      if (signal?.aborted || error?.name === 'AbortError') {
+        throw fsError('FS_ABORTED', `cannot read "${target.displayPath}": aborted`, error)
+      }
+      throw fsError('FS_IO_ERROR', `cannot read "${target.displayPath}": ${error.message}`, error)
+    }
+    return new Uint8Array(Buffer.concat(chunks, bytes))
   }
 
   async listDir(target) {

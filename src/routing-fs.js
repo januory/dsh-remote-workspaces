@@ -205,6 +205,18 @@ export class RoutingFileSystem {
     return backend.readBytes(sub, signal, maxBytes)
   }
 
+  /**
+   * Windowed raw-byte read (`[offset, offset + length)`), delegated to the
+   * routed backend. The harness's `workspace-files` byte routes call this for
+   * the Sidebar Files / document preview — PDF, HTML and every image — so it is
+   * as load-bearing as `readBytes`, and its absence fails the preview with
+   * `this.ctx.fs.readByteRange is not a function`.
+   */
+  readByteRange(target, range, signal) {
+    const { backend, target: sub } = this.splitTarget(target)
+    return backend.readByteRange(sub, range, signal)
+  }
+
   async listDir(target) {
     const key = String(target.targetKey)
     const isRemote = key.startsWith('ssh://')

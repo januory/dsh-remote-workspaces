@@ -12,11 +12,12 @@
  * All fixtures use neutral placeholders (example host/user/paths).
  */
 import {
-  mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, readdirSync,
+  mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, readdirSync, createReadStream,
 } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { RoutingFileSystem } from '../src/routing-fs.js'
+import { SftpBackend } from '../src/fs-sftp.js'
 import { registerAnchor } from '../src/registry.js'
 
 const results = []
@@ -41,6 +42,7 @@ process.env.DSH_HOME = home
 const ws = join(home, 'ws')
 mkdirSync(ws, { recursive: true })
 writeFileSync(join(ws, 'a.txt'), 'hello routing')
+writeFileSync(join(ws, 'ramp.bin'), Buffer.from(Array.from({ length: 256 }, (_, i) => i)))
 
 const localPolicy = () => ({ resolve: () => ({ mode: 'workspace-write', workspaceRoot: ws }) })
 const rfsLocal = new RoutingFileSystem({ getPolicy: localPolicy, clientForRemote: () => { throw new Error('no remote') } })
@@ -56,6 +58,12 @@ try {
   check('listDir', list.some((e) => e.name === 'a.txt'))
   const w = await rfsLocal.writeText(t1, 'updated', undefined, undefined, { mode: 'workspace-write', workspaceRoot: ws })
   check('writeText', w.operation === 'update' && readFileSync(join(ws, 'a.txt'), 'utf8') === 'updated')
+  // The preview primitive the harness's workspace-files byte routes call.
+  const localWin = Buffer.from(await rfsLocal.readByteRange(
+    await rfsLocal.resolve(join(ws, 'ramp.bin')),
+    { offset: 10, length: 3 },
+  ))
+  check('readByteRange routes to the local backend', localWin.equals(Buffer.from([10, 11, 12])), localWin.toString('hex'))
 } catch (e) {
   check('local routing flow no throw', false, e && (e.stack || e.message))
 }
@@ -101,6 +109,11 @@ function attrsOf(st) {
   }
 }
 const fakeSftp = {
+  // The real facade carries the raw SFTPWrapper; the windowed read streams from
+  // it (start/end inclusive), so the stand-in mirrors that with node's stream.
+  raw: {
+    createReadStream(remotePath, opts) { return createReadStream(mirrorOf(remotePath), opts) },
+  },
   async realpath(p) {
     if (!existsSync(mirrorOf(p))) throw missingError()
     return p
@@ -148,6 +161,19 @@ try {
   const childText = await rfsRemote.readText(child)
   check('readText reads the remote content', childText === 'remote file content', JSON.stringify(childText))
   check('contains(remote root, remote child)', rfsRemote.contains(rootT, child))
+
+  // Windowed read over the routed backend: what the Files preview requests.
+  const remoteWin = Buffer.from(await rfsRemote.readByteRange(child, { offset: 0, length: 6 }))
+  check('readByteRange streams the remote window', remoteWin.toString('utf8') === 'remote', remoteWin.toString('utf8'))
+  const remoteCapped = await rfsRemote.readByteRange(child, { offset: 0, length: 4096 })
+  check('readByteRange stops at the end of the remote file', remoteCapped.length === childText.length, String(remoteCapped.length))
+  check('readByteRange past the remote end is empty', (await rfsRemote.readByteRange(child, { offset: 4096, length: 8 })).length === 0)
+
+  // A facade without the raw wrapper (a minimal double) still answers windows.
+  const stub = new SftpBackend({ host: REMOTE.host, sftp: async () => ({ stat: fakeSftp.stat, readFile: fakeSftp.readFile }) })
+  const stubTarget = { targetKey: `${REMOTE.root}/b.txt`, displayPath: `${REMOTE.root}/b.txt` }
+  const stubWin = Buffer.from(await stub.readByteRange(stubTarget, { offset: 7, length: 4 }))
+  check('readByteRange falls back to a whole read without a raw channel', stubWin.toString('utf8') === 'file', stubWin.toString('utf8'))
 
   // Slash-mixed spelling: Files joins with '/', anchor keys use the native sep.
   const childSlash = await rfsRemote.resolve(`${anchorFlat}/b.txt`, { cwd: anchor })

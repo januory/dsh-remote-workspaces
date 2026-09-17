@@ -3,7 +3,7 @@
  *
  * A plain backend over the ssh2 SFTP channel — does NOT extend the
  * `FileSystem` service, so the routing provider can hold it without registering
- * `ctx.fs`. Implements the same 12 operations on plain targets and version
+ * `ctx.fs`. Implements the same 13 operations on plain targets and version
  * strings, using SFTP primitives (readdir/stat/readFile/writeFile/rename) so
  * type detection and ENOENT handling are locale-independent (a shell `stat`
  * localized to the remote's locale broke type/absence detection).
@@ -12,6 +12,7 @@
 import { posix } from 'node:path'
 import { createHash } from 'node:crypto'
 import { fsError } from './errors.js'
+import { byteWindow } from './byte-window.js'
 
 function isMissing(error) {
   const code = error && error.code
@@ -142,6 +143,47 @@ export class SftpBackend {
     const sftp = await this.sftp()
     const buf = await sftp.readFile(target.targetKey)
     return new Uint8Array(Buffer.from(buf))
+  }
+
+  /**
+   * Read the bytes at `[offset, offset + length)` over SFTP — the windowed twin
+   * of `readBytes`, and the primitive the harness's `workspace-files` byte
+   * routes need to preview a remote image/PDF/HTML. The ssh2 facade carries the
+   * raw SFTPWrapper (`raw`), whose `createReadStream` honors `start`/`end`, so
+   * the window is what crosses the wire: a 100 MiB remote file costs a window,
+   * not the whole file. A facade without that primitive (a test double) falls
+   * back to a whole read and slice.
+   */
+  async readByteRange(target, range, signal) {
+    if (signal?.aborted) throw fsError('FS_ABORTED', `cannot read "${target.displayPath}": aborted`)
+    const info = await this.stat(target)
+    if (info === undefined) throw fsError('FS_NOT_FOUND', `cannot read "${target.displayPath}": not found`)
+    if (info.type !== 'file') throw fsError('FS_NOT_REGULAR_FILE', `cannot read "${target.displayPath}": not a regular file`)
+    const { offset, length } = byteWindow(range)
+    if (length === 0) return new Uint8Array(0)
+    const sftp = await this.sftp()
+    const raw = sftp.raw
+    if (raw === undefined || typeof raw.createReadStream !== 'function') {
+      const whole = Buffer.from(await sftp.readFile(target.targetKey))
+      return new Uint8Array(whole.subarray(offset, offset + length))
+    }
+    const stream = raw.createReadStream(target.targetKey, { start: offset, end: offset + length - 1 })
+    const onAbort = () => stream.destroy(new Error('aborted'))
+    signal?.addEventListener('abort', onAbort, { once: true })
+    const chunks = []
+    let bytes = 0
+    try {
+      for await (const chunk of stream) {
+        chunks.push(chunk)
+        bytes += chunk.length
+      }
+    } catch (error) {
+      if (signal?.aborted) throw fsError('FS_ABORTED', `cannot read "${target.displayPath}": aborted`, error)
+      throw fsError('FS_IO_ERROR', `cannot read "${target.displayPath}": ${error.message}`, error)
+    } finally {
+      signal?.removeEventListener('abort', onAbort)
+    }
+    return new Uint8Array(Buffer.concat(chunks, bytes))
   }
 
   async listDir(target) {
