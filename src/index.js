@@ -40,10 +40,10 @@ export const name = 'dsh-remote-workspaces'
 const PACKAGE = 'dsh-remote-workspaces'
 const NAMESPACE = 'remoteWorkspaces'
 
-// A strict codec must carry a `create()` factory: the Typert registry validates
-// it at registration, and both gateways materialize the schema with
-// `codec.create().parse(value)` on first boundary use. The hand-rolled contract
-// therefore exposes a pass-through JSON schema through that factory.
+// A strict codec must carry a `schema` with `parse()`: the Typert registry
+// validates it at registration and both gateways decode with
+// `codec.schema.parse(value)`. `create` is kept for the 0.1.5-line harness,
+// which spelled the same contract as a factory, so both generations accept it.
 const JSON_SCHEMA = Object.freeze({
   parse(value) { return value },
 })
@@ -51,6 +51,7 @@ const JSON_SCHEMA = Object.freeze({
 const JSON_CODEC = Object.freeze({
   mode: 'strict',
   typeSymbol: 'JsonValue',
+  schema: JSON_SCHEMA,
   create: () => JSON_SCHEMA,
 })
 
