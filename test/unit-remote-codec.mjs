@@ -184,6 +184,74 @@ check('both halves spell the codec the same way',
   && JSON.stringify(Object.keys(hostDescriptors[0].result).sort()) === JSON.stringify(Object.keys(clientDescriptors[0].result).sort()),
   JSON.stringify(Object.keys(clientDescriptors[0]?.result ?? {}).sort()))
 
+// --- the optional-argument contract (`missing "cwd"`) ------------------------
+/**
+ * `openShellAt(cwd, opts)` takes an OPTIONAL `cwd`: the host opens the harness
+ * process cwd when it is absent. The gateway builds `args` from the positional
+ * call and DROPS a parameter whose value is `undefined`
+ * (`prepareInvocation`, packages/api/gateway/src/client/index.ts), and the host
+ * then rejects a request whose declared field is absent. On DSH
+ * 0.1.6-alpha.2 that surfaced, from the terminal seat's cwd-less call, as
+ *
+ *   typert gateway: remoteWorkspaces/openShellAt: args fields do not match the
+ *   descriptor: missing "cwd"
+ *
+ * so an omissible field MUST be declared (`acceptsUndefined: true`), or the
+ * client must never send `undefined`. Both halves are pinned for both.
+ *
+ * `assertExactArguments` (packages/api/gateway/src/index.ts, the running
+ * harness's own gate) is transcribed below: DSH is not a dependency of this
+ * bundle, so the negative control is what keeps the transcription honest.
+ */
+function missingFields(descriptor, args) {
+  const expected = new Set(descriptor.parameters.map((parameter) => parameter.wire))
+  if (descriptor.invocation.kind === 'context') expected.add(descriptor.invocation.wire)
+  const acceptsMissing = new Set(descriptor.parameters
+    .filter((parameter) => parameter.source === 'json'
+      && (parameter.acceptsUndefined === true || parameter.codec.mode === 'src-json'))
+    .map((parameter) => parameter.wire))
+  return [...expected].filter((key) => !Object.hasOwn(args, key) && !acceptsMissing.has(key))
+}
+
+const findEndpoint = (descriptors, wanted) => descriptors.find((d) => endpoint(d) === wanted)
+const hostOpenAt = findEndpoint(hostDescriptors, 'remoteWorkspaces/openShellAt')
+const clientOpenAt = findEndpoint(clientDescriptors, 'remoteWorkspaces/openShellAt')
+
+for (const [halfName, descriptor] of [['host', hostOpenAt], ['client', clientOpenAt]]) {
+  const cwd = descriptor?.parameters?.[0]
+  check(`${halfName} declares openShellAt's cwd as omissible (acceptsUndefined)`,
+    cwd?.wire === 'cwd' && cwd?.acceptsUndefined === true,
+    JSON.stringify(descriptor?.parameters))
+  // The gate accepts the exact cwd-less call the terminal seat makes once the
+  // current session has no cwd yet, and `opts` stays required.
+  check(`${halfName}'s cwd-less openShellAt call passes the host argument gate`,
+    descriptor !== undefined && missingFields(descriptor, { opts: { rows: 24, cols: 80 } }).length === 0
+    && missingFields(descriptor, { cwd: '/tmp', opts: {} }).length === 0
+    && JSON.stringify(missingFields(descriptor, { cwd: '/tmp' })) === '["opts"]',
+    descriptor === undefined ? 'no descriptor' : JSON.stringify(missingFields(descriptor, { opts: {} })))
+}
+
+// Negative control: the same transcribed gate still catches a genuinely
+// missing required field, so a blanket "nothing is required" regression fails.
+const hostWrite = findEndpoint(hostDescriptors, 'remoteWorkspaces/shellWrite')
+check('the argument gate still rejects a missing required field (negative control)',
+  hostWrite !== undefined && JSON.stringify(missingFields(hostWrite, { id: 'x' })) === '["data"]',
+  hostWrite === undefined ? 'no descriptor' : JSON.stringify(missingFields(hostWrite, { id: 'x' })))
+
+check('both halves spell the openShellAt parameters the same way',
+  hostOpenAt !== undefined && clientOpenAt !== undefined
+  && JSON.stringify(hostOpenAt.parameters) === JSON.stringify(clientOpenAt.parameters),
+  JSON.stringify(clientOpenAt?.parameters))
+
+// The seat itself: it must never hand the gateway an `undefined` positional
+// argument, because the gateway would silently drop it and the host would
+// reject the call. Pinned at the source level — the seat needs a live xterm,
+// a session store and a mounted remote to run.
+const seatSource = (await import('node:fs')).readFileSync(join(root, 'src', 'client.js'), 'utf8')
+check('the terminal seat sends a defined cwd, never undefined',
+  /var cwd = typeof wanted === 'string' \? wanted : ''/.test(seatSource)
+  && !/var cwd = getCwd \? getCwd\(\) : undefined/.test(seatSource))
+
 rmSync(scratch, { recursive: true, force: true })
 rmSync(scratchHome, { recursive: true, force: true })
 

@@ -55,8 +55,15 @@ const JSON_CODEC = Object.freeze({
   create: () => JSON_SCHEMA,
 })
 
-function jsonParameter(name) {
-  return { name, wire: name, source: 'json', codec: JSON_CODEC }
+function jsonParameter(name, options) {
+  const parameter = { name, wire: name, source: 'json', codec: JSON_CODEC }
+  // `acceptsUndefined: true` declares a field the caller may omit entirely,
+  // the type-level `cwd?: string`. The gateway builds `args` from the
+  // positional call and DROPS a parameter whose value is `undefined`, so
+  // without this flag the host rejects the call with
+  // `args fields do not match the descriptor: missing "cwd"`.
+  if (options?.acceptsUndefined === true) parameter.acceptsUndefined = true
+  return parameter
 }
 
 function invocation(method, parameters = []) {
@@ -83,7 +90,9 @@ const INVOCATIONS = [
   invocation('openRemoteWorkspace', [jsonParameter('machine'), jsonParameter('path')]),
   invocation('openShellLocal', [jsonParameter('opts')]),
   invocation('openShellRemote', [jsonParameter('machine'), jsonParameter('opts')]),
-  invocation('openShellAt', [jsonParameter('cwd'), jsonParameter('opts')]),
+  // `cwd` is optional: the host falls back to the harness process cwd when it
+  // is absent, so the descriptor must allow the omission.
+  invocation('openShellAt', [jsonParameter('cwd', { acceptsUndefined: true }), jsonParameter('opts')]),
   invocation('shellWrite', [jsonParameter('id'), jsonParameter('data')]),
   invocation('shellRead', [jsonParameter('id')]),
   invocation('shellResize', [jsonParameter('id'), jsonParameter('rows'), jsonParameter('cols')]),

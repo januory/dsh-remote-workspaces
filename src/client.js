@@ -52,8 +52,14 @@ var JSON_CODEC = Object.freeze({
   create: function () { return JSON_SCHEMA },
 })
 
-function jsonParameter(name) {
-  return { name: name, wire: name, source: 'json', codec: JSON_CODEC }
+function jsonParameter(name, options) {
+  var parameter = { name: name, wire: name, source: 'json', codec: JSON_CODEC }
+  // `acceptsUndefined: true` marks a field the caller may omit entirely (see
+  // src/index.js): the gateway DROPS an undefined positional argument when it
+  // builds `args`, and the host rejects a call that lacks a declared-required
+  // field with `args fields do not match the descriptor: missing "cwd"`.
+  if (options && options.acceptsUndefined === true) parameter.acceptsUndefined = true
+  return parameter
 }
 
 function invocation(method, parameters) {
@@ -80,7 +86,8 @@ var INVOCATIONS = [
   invocation('openRemoteWorkspace', [jsonParameter('machine'), jsonParameter('path')]),
   invocation('openShellLocal', [jsonParameter('opts')]),
   invocation('openShellRemote', [jsonParameter('machine'), jsonParameter('opts')]),
-  invocation('openShellAt', [jsonParameter('cwd'), jsonParameter('opts')]),
+  // Must match src/index.js: `cwd` is omissible.
+  invocation('openShellAt', [jsonParameter('cwd', { acceptsUndefined: true }), jsonParameter('opts')]),
   invocation('shellWrite', [jsonParameter('id'), jsonParameter('data')]),
   invocation('shellRead', [jsonParameter('id')]),
   invocation('shellResize', [jsonParameter('id'), jsonParameter('rows'), jsonParameter('cols')]),
@@ -1111,7 +1118,16 @@ function unwrapRemote(res) {
             setStatus('open')
           }
           var opts = { rows: term.rows, cols: term.cols, key: key }
-          var cwd = getCwd ? getCwd() : undefined
+          // A seat with no current session yet has no cwd, and `undefined`
+          // must never be the wire value: the gateway builds `args` from the
+          // positional call and drops an undefined parameter, after which the
+          // host rejects the call — `args fields do not match the descriptor:
+          // missing "cwd"`. '' is this plugin's spelling of "no cwd"; the
+          // host then opens the shell at the harness process cwd. The `cwd`
+          // field is also declared `acceptsUndefined: true`, which keeps an
+          // already-loaded older host half working.
+          var wanted = getCwd ? getCwd() : undefined
+          var cwd = typeof wanted === 'string' ? wanted : ''
           ns.openShellAt(cwd, opts).then(
             function (res) {
               if (disposed) return
