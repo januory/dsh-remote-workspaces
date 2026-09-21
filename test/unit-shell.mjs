@@ -110,7 +110,7 @@ const bypassVerdict = await verdict({ command: 'x', workdir: 'C:\\Users\\x', san
 check('remote session: run() refuses a local workdir that bypassed resolve()', bypassVerdict.includes('refusing to run locally'), bypassVerdict)
 let startVerdict = ''
 try {
-  ex.start({ command: 'x', workdir: 'C:\\Users\\x', sandboxPolicy: winSession })
+  await ex.start({ command: 'x', workdir: 'C:\\Users\\x', sandboxPolicy: winSession })
 } catch (error) {
   startVerdict = error instanceof Error ? error.message : String(error)
 }
@@ -130,7 +130,7 @@ check('local session: run() is NOT refused (reaches the local executor)', localV
     getSandbox: () => undefined,
     getSubprocess: () => undefined,
   })
-  const proc = startEx.start({ command: 'sleep 1', workdir: 'ssh://root@10.0.0.7:22/data/x', timeoutMs: 1000 })
+  const proc = await startEx.start({ command: 'sleep 1', workdir: 'ssh://root@10.0.0.7:22/data/x', timeoutMs: 1000 })
   await proc.done
   const first = proc.readOutput()
   const second = proc.readOutput()

@@ -75,7 +75,7 @@ async function expectCode(code, fn, label) {
     JSON.stringify(denied.sandbox))
   check('remote shell denial reports non-zero exit', denied.exitCode === 1)
 
-  const proc = ex.start(ex.resolve({ command: 'rm -rf /', workdir, sandboxPolicy: { mode: 'read-only', workspaceRoot: anchor } }))
+  const proc = await ex.start(ex.resolve({ command: 'rm -rf /', workdir, sandboxPolicy: { mode: 'read-only', workspaceRoot: anchor } }))
   check('remote shell start denied under read-only',
     proc.status === 'completed' && proc.sandbox !== undefined && proc.sandbox.denied === true)
 
@@ -84,7 +84,7 @@ async function expectCode(code, fn, label) {
     ww.sandbox !== undefined && ww.sandbox.denied === true && ww.sandbox.mode === 'workspace-write',
     JSON.stringify(ww.sandbox))
 
-  const wwProc = ex.start(ex.resolve({ command: 'rm -rf /', workdir, sandboxPolicy: { mode: 'workspace-write', workspaceRoot: anchor } }))
+  const wwProc = await ex.start(ex.resolve({ command: 'rm -rf /', workdir, sandboxPolicy: { mode: 'workspace-write', workspaceRoot: anchor } }))
   check('remote shell start denied under workspace-write',
     wwProc.status === 'completed' && wwProc.sandbox !== undefined && wwProc.sandbox.denied === true)
 

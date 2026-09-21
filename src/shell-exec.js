@@ -241,10 +241,15 @@ export class SshShellExecutor {
     return this.localRun(spec)
   }
 
-  start(spec) {
+  /**
+   * Async because confinement preparation is async on DSH >= 0.1.6-alpha.1,
+   * and the shell seam itself declares `start(): Promise<ShellProcess>` — the
+   * harness awaits it either way, so a refusal rejects instead of throwing.
+   */
+  async start(spec) {
     if (isRemoteCwd(spec.workdir)) return this.remoteStart(spec)
     this.assertNotLocalInRemoteSession(spec)
-    return this.localStart(spec)
+    return await this.localStart(spec)
   }
 
   // -------------------------------------------------------------------------
@@ -486,17 +491,31 @@ export class SshShellExecutor {
       : ['bash', '-c', spec.command]
   }
 
-  confine(argv, policy) {
+  /**
+   * Wrap `argv` through `ctx.sandbox`. DSH 0.1.6-alpha.1 made `confine()`
+   * ASYNC (`Promise<ConfinedArgv>`, commit caa69608fb "refactor(sandbox):
+   * await cancellable preparation in process consumers"), so consuming it
+   * synchronously left `confined.argv` undefined and the subprocess provider's
+   * destructuring threw
+   *
+   *   undefined is not iterable (cannot read property Symbol(Symbol.iterator))
+   *
+   * before the command ever started. Preparation is cancellable, so the
+   * caller's signal is forwarded exactly as the harness's own bash/pwsh
+   * executors do; provider failures (e.g. SandboxUnavailableError) propagate
+   * unchanged rather than being reshaped here.
+   */
+  async confine(argv, policy, signal) {
     if (policy === undefined || policy.mode === 'danger-full-access') {
       return { argv, enforcement: undefined, denialSignatures: [] }
     }
     const sandbox = this.getSandbox()
     if (!sandbox) throw new Error('sandbox backend unavailable: refusing to run unconfined')
-    return sandbox.confine(argv, {
+    return await sandbox.confine(argv, {
       mode: policy.mode,
       workspaceRoot: policy.workspaceRoot,
       ...(policy.sessionId !== undefined ? { sessionId: policy.sessionId } : {}),
-    })
+    }, signal)
   }
 
   policy(spec) {
@@ -521,10 +540,18 @@ export class SshShellExecutor {
 
   async localRun(spec) {
     const policy = this.policy(spec)
-    const confined = this.confine(this.argv(spec), policy)
     const subprocess = this.getSubprocess()
     if (!subprocess) throw new Error('subprocess service unavailable')
     const d = makeDeadline(spec.signal, spec.timeoutMs)
+    // Confinement runs under the same deadline as the command it prepares:
+    // the provider may have to start a runner, which is cancellable work.
+    let confined
+    try {
+      confined = await this.confine(this.argv(spec), policy, d.signal)
+    } catch (error) {
+      d.dispose()
+      throw error
+    }
     let handle
     try {
       handle = subprocess.spawn(this.spawnSpec(spec, confined.argv, spec.stdoutMaxBytes, d.signal))
@@ -559,11 +586,11 @@ export class SshShellExecutor {
     return { text: read.text, truncated: read.lossy, ...(read.spillPath !== undefined ? { spillPath: read.spillPath } : {}) }
   }
 
-  localStart(spec) {
+  async localStart(spec) {
     const policy = this.policy(spec)
-    const confined = this.confine(this.argv(spec), policy)
     const subprocess = this.getSubprocess()
     if (!subprocess) throw new Error('subprocess service unavailable')
+    const confined = await this.confine(this.argv(spec), policy, spec.signal)
     const running = subprocess.spawn(this.spawnSpec(spec, confined.argv, DEFAULT_STDOUT_MAX_BYTES, spec.signal))
     const { stdout, stderr } = running.collected
     let spawnFailureNote

@@ -123,7 +123,7 @@ check('the fake host probes as a POSIX remote', profile.family === 'posix', JSON
     getSandbox: () => undefined,
     getSubprocess: () => undefined,
   })
-  const proc = ex.start({ command: 'sleep 300', workdir: 'ssh://root@10.0.0.7:22/data/x', timeoutMs: 1000 })
+  const proc = await ex.start({ command: 'sleep 300', workdir: 'ssh://root@10.0.0.7:22/data/x', timeoutMs: 1000 })
   const launched = await waitFor(() => launchScript !== '')
   check('the POSIX launcher reached the remote', launched, launchScript.split('\n')[0])
   check('the launcher runs the command under setsid (own session + process group)', /(^|\n)setsid sh -c 'sleep 300' /.test(launchScript), JSON.stringify(launchScript))
