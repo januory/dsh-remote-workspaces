@@ -58,6 +58,8 @@ let groupKillCommand = ''
 let shellKillCommand = ''
 let markerScript = ''
 let jobAlive = true
+let exitReads = 0
+const cleanedDirs = []
 const heldStreams = []
 
 const { privateKey } = generateKeyPairSync('rsa', {
@@ -93,9 +95,16 @@ const server = new Server({ hostKeys: [privateKey] }, (client) => {
         // The reaper of a background job's group, and that job's liveness poll.
         if (cmd.includes(`kill -TERM -${JOB_PID}`)) { groupKillCommand = cmd; jobAlive = false; return done(0) }
         if (cmd.includes('kill -0')) return done(0, jobAlive ? 'yes\n' : 'no\n')
-        // The POSIX background launcher; it prints the detached pid like `$!`.
-        if (cmd.includes('setsid')) { launchScript = cmd; return done(0, `${JOB_PID}\n`) }
+        // The POSIX background launcher; it prints its temp dir, then the
+        // detached pid like `$!`.
+        if (cmd.includes('setsid')) {
+          launchScript = cmd
+          return done(0, `DWSH_DIR=/tmp/dsh-posix-reap-${JOB_PID}\n${JOB_PID}\n`)
+        }
         if (cmd.includes('tail -c')) return done(0, 'JOB-OUT\n')
+        // The command's own exit status, written by the detached launcher.
+        if (cmd.includes('/exit')) { exitReads += 1; return done(0, '0\n') }
+        if (cmd.includes('rm -rf')) { cleanedDirs.push(cmd); return done(0) }
         // A normal foreground command: the shell's own `echo DWSH_PID=$`
         // produces the marker line ahead of the command's output.
         if (cmd.includes('echo DWSH_PID=$')) { markerScript = cmd; return done(0, `DWSH_PID=${SHELL_PID}\nhi\n`) }
@@ -126,11 +135,15 @@ check('the fake host probes as a POSIX remote', profile.family === 'posix', JSON
   const proc = await ex.start({ command: 'sleep 300', workdir: 'ssh://root@10.0.0.7:22/data/x', timeoutMs: 1000 })
   const launched = await waitFor(() => launchScript !== '')
   check('the POSIX launcher reached the remote', launched, launchScript.split('\n')[0])
-  check('the launcher runs the command under setsid (own session + process group)', /(^|\n)setsid sh -c 'sleep 300' /.test(launchScript), JSON.stringify(launchScript))
+  check('the launcher runs the command under setsid (own session + process group)',
+    launchScript.includes("setsid sh -c 'sleep 300 > \"$dir/out\""), JSON.stringify(launchScript))
   check('the launcher keeps a nohup fallback for hosts without setsid', launchScript.includes('command -v setsid') && launchScript.includes('nohup sh -c'), JSON.stringify(launchScript.split('\n').slice(0, 6)))
   check('the launcher still reports the pid it recorded', launchScript.trim().endsWith('echo $!'), JSON.stringify(launchScript.trim().split('\n').slice(-1)[0]))
   check('the job is detached from the exec channel stdin', launchScript.includes('</dev/null'), JSON.stringify(launchScript))
-  check('the launcher still redirects the job log', /2>&1/.test(launchScript) && launchScript.includes('.dsh-bg-'), JSON.stringify(launchScript))
+  check('the launcher separates the job streams under a per-command temp dir',
+    launchScript.includes('mktemp -d') && launchScript.includes('"$dir/out"') && launchScript.includes('"$dir/err"') && launchScript.includes("printf 'DWSH_DIR=%s"),
+    JSON.stringify(launchScript))
+  check('the launcher records the command\u2019s own exit status', launchScript.includes('echo $? > "$dir/exit"'), JSON.stringify(launchScript))
   check('the bare nohup-and-background launcher is gone', !/nohup sh -c [^\n]*&\necho \$!/.test(launchScript), JSON.stringify(launchScript))
 
   // --- 2. kill() reaps the GROUP of the recorded pid ------------------------
@@ -140,6 +153,22 @@ check('the fake host probes as a POSIX remote', profile.family === 'posix', JSON
   check('kill() sends the negative-pid (group) kill for the recorded pid', reaped && groupKillCommand.includes(`kill -TERM -${JOB_PID}`), JSON.stringify(groupKillCommand))
   check('the group kill keeps the single-pid fallback', groupKillCommand.includes(`kill -TERM ${JOB_PID}`), JSON.stringify(groupKillCommand))
   check('the job ends as killed once the group is reaped', await waitFor(() => proc.status === 'killed'), proc.status)
+  check('the killed job\u2019s temp directory is removed', await waitFor(() => cleanedDirs.length > 0), JSON.stringify(cleanedDirs))
+
+  // --- 2b. the unified seam: `result()` is what the 0.1.7 jobs path awaits ---
+  const job = await ex.execute(ex.resolve({
+    command: 'sleep 300',
+    workdir: 'ssh://root@10.0.0.7:22/data/x',
+    timeoutMs: 1000,
+    onExpiry: 'none',
+  }))
+  await waitFor(() => job.status === 'completed')
+  const jobResult = await job.result()
+  check('execute({ onExpiry: \'none\' }) resolves with a real exit code',
+    jobResult.exitCode === 0 && jobResult.timedOut === false, JSON.stringify(jobResult))
+  check('the settled job served its stdout on the observed stream',
+    job.observed.stdout.readFrom(0).text.includes('JOB-OUT'), JSON.stringify(job.observed.stdout.readFrom(0)))
+  check('the exited job read its exit status from the remote once', exitReads >= 1, `reads=${exitReads}`)
 }
 
 // --- 3. a foreground command self-reports its group leader ------------------

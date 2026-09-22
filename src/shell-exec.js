@@ -68,6 +68,22 @@ function messageOf(error) {
 }
 
 /**
+ * A non-consuming offset reader over text the executor retains. It is the
+ * `observed` half of a process handle: independent consumers (the job
+ * registry's output pump) read at their own offsets without stealing bytes
+ * from the consuming {@link SshShellExecutor} `readOutput()` cursor.
+ */
+function textReader(getText, getLossy = () => false) {
+  return {
+    readFrom(fromByte) {
+      const text = getText()
+      const from = Number.isFinite(fromByte) && fromByte > 0 ? Math.min(Math.floor(fromByte), text.length) : 0
+      return { text: text.slice(from), nextOffset: text.length, lossy: getLossy() }
+    },
+  }
+}
+
+/**
  * Resolve the pwsh executable (mirrors the harness's `resolvePwshPath`): the
  * Windows ACL runner needs a full path (a bare `pwsh` fails CreateProcessAsUser
  * with Win32 error 2), so probe PowerShell 7, PATH entries, then PowerShell 5.1.
@@ -226,6 +242,10 @@ export class SshShellExecutor {
       command: request.command,
       workdir: this.translateWorkdir(workdir, session),
       timeoutMs,
+      // DSH 0.1.7-alpha.2 moved the run()/start() split into the spec: `kill`
+      // (the default) arms the foreground deadline, `none` is the background
+      // contract where the caller bounds its own wait.
+      onExpiry: request.onExpiry ?? 'kill',
       stdoutMaxBytes,
       ...(request.signal ? { signal: request.signal } : {}),
       ...(request.stdin !== undefined ? { stdin: request.stdin } : {}),
@@ -235,6 +255,11 @@ export class SshShellExecutor {
     }
   }
 
+  /**
+   * The legacy foreground half. DSH 0.1.7-alpha.2 replaced the run()/start()
+   * pair with {@link execute}, which returns the live handle; this path is
+   * unchanged and still backs `onExpiry: 'kill'`.
+   */
   async run(spec) {
     if (isRemoteCwd(spec.workdir)) return this.remoteRun(spec)
     this.assertNotLocalInRemoteSession(spec)
@@ -242,14 +267,153 @@ export class SshShellExecutor {
   }
 
   /**
-   * Async because confinement preparation is async on DSH >= 0.1.6-alpha.1,
-   * and the shell seam itself declares `start(): Promise<ShellProcess>` — the
-   * harness awaits it either way, so a refusal rejects instead of throwing.
+   * The legacy background half, and the `onExpiry: 'none'` half of
+   * {@link execute}. Async because confinement preparation is async on
+   * DSH >= 0.1.6-alpha.1; the handles it returns are full `ShellExecution`s so
+   * either generation of consumer finds what it needs.
    */
   async start(spec) {
     if (isRemoteCwd(spec.workdir)) return this.remoteStart(spec)
     this.assertNotLocalInRemoteSession(spec)
     return await this.localStart(spec)
+  }
+
+  /**
+   * The DSH >= 0.1.7-alpha.2 seam (commit d6bebc5783 "feat(shell): converge on
+   * execute()"): ONE method returns the live handle and the caller decides
+   * what it wants from it — `result()` for a foreground outcome, or the handle
+   * itself as a job. The old run()/start() split rides the spec's `onExpiry`:
+   * `'kill'` (the default) is the foreground half, `'none'` the background one.
+   *
+   * Without this method the harness's `bash`/`pwsh` tools threw
+   * `ctx.shell.execute is not a function`. With a jobs registry present they
+   * also route EVERY foreground call through `onExpiry: 'none'` (registering
+   * it as a job at its start and awaiting `result()` once it settles), so the
+   * background handle must answer `result()` too.
+   */
+  async execute(spec) {
+    if (spec.onExpiry === 'none') return await this.start(spec)
+    return this.foreground(spec)
+  }
+
+  /**
+   * `onExpiry: 'kill'` as a handle: the proven {@link run} path stays the
+   * execution mechanism (confinement, remote reaping, output caps), and the
+   * handle is a projection over it so `kill()` can cancel a command that is
+   * still in flight.
+   */
+  foreground(spec) {
+    const ctl = this.killSwitch(spec)
+    const run = isRemoteCwd(spec.workdir)
+      ? this.remoteRun(ctl.spec)
+      : (this.assertNotLocalInRemoteSession(ctl.spec), this.localRun(ctl.spec))
+    return this.executionView(run, ctl)
+  }
+
+  /**
+   * A foreground run owns its deadline internally (`makeDeadline`), so the
+   * caller cannot reach the process through `spec.signal` alone. This gives
+   * the handle a signal of its own, fused with the caller's, whose abort is
+   * the exact kill the caller's own cancellation would have performed.
+   */
+  killSwitch(spec) {
+    const ac = new AbortController()
+    const parent = spec.signal
+    const onAbort = () => { if (!ac.signal.aborted) ac.abort(parent?.reason) }
+    if (parent !== undefined) {
+      if (parent.aborted) onAbort()
+      else parent.addEventListener('abort', onAbort, { once: true })
+    }
+    return {
+      spec: { ...spec, signal: ac.signal },
+      dispose: () => { try { parent?.removeEventListener('abort', onAbort) } catch { /* already gone */ } },
+      kill: () => {
+        if (ac.signal.aborted) return false
+        ac.abort(new Error('command killed'))
+        return true
+      },
+    }
+  }
+
+  /**
+   * Project an in-flight foreground `run()` as the unified execution handle.
+   * `result()` memoizes the run promise, so a consumer that only keeps the
+   * handle (a job) never owns its rejection; `done` never rejects and carries
+   * the process facts; the stream readers serve what the run collected.
+   */
+  executionView(run, ctl) {
+    let outcome
+    let failure
+    let resultPromise
+    let outOffset = 0
+    let errOffset = 0
+    const stdoutText = () => (outcome === undefined ? '' : outcome.stdout.text)
+    const stderrText = () => (failure !== undefined
+      ? `spawn failed: ${messageOf(failure)}`
+      : outcome === undefined ? '' : outcome.stderr.text)
+    const view = {
+      status: 'running',
+      exitCode: null,
+      signal: null,
+      done: Promise.resolve(),
+      observed: { stdout: textReader(stdoutText), stderr: textReader(stderrText) },
+      readOutput() {
+        const out = stdoutText()
+        const err = stderrText()
+        const outDelta = out.slice(outOffset)
+        const errDelta = err.slice(errOffset)
+        outOffset = out.length
+        errOffset = err.length
+        const separator = outDelta.length > 0 && !outDelta.endsWith('\n') ? '\n' : ''
+        return { delta: outDelta + (errDelta.length > 0 ? `${separator}[stderr]\n${errDelta}` : ''), lossy: false }
+      },
+      kill() {
+        if (view.status !== 'running') return false
+        view.status = 'killed'
+        return ctl.kill()
+      },
+      result() {
+        return (resultPromise ??= run)
+      },
+    }
+    view.done = run.then((result) => {
+      outcome = result
+      if (view.status === 'running') view.status = result.aborted === true ? 'killed' : 'completed'
+      view.exitCode = result.exitCode ?? null
+      view.signal = result.signal ?? null
+      if (result.sandbox !== undefined) view.sandbox = result.sandbox
+      ctl.dispose()
+    }, (error) => {
+      failure = error
+      view.status = 'killed'
+      ctl.dispose()
+    })
+    return view
+  }
+
+  /**
+   * An already-settled handle for an execution that never spawns (a remote
+   * command the sandbox policy refuses). The harness classifies the denial
+   * from `result().sandbox`, exactly as the foreground path did before the
+   * seam converged.
+   */
+  settledExecution(result) {
+    let consumed = false
+    return {
+      status: 'completed',
+      exitCode: result.exitCode,
+      signal: result.signal,
+      ...(result.sandbox !== undefined ? { sandbox: result.sandbox } : {}),
+      done: Promise.resolve(),
+      observed: { stdout: textReader(() => result.stdout.text), stderr: textReader(() => result.stderr.text) },
+      readOutput() {
+        if (consumed) return { delta: '', lossy: false }
+        consumed = true
+        return { delta: result.stdout.text, lossy: result.stdout.truncated }
+      },
+      kill() { return false },
+      result: () => Promise.resolve(result),
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -312,23 +476,25 @@ export class SshShellExecutor {
     }
   }
 
+  /**
+   * The `onExpiry: 'none'` half: a detached, live execution handle. POSIX
+   * launches through `setsid`/`nohup` into a per-command temp directory (its
+   * stdout, stderr, and exit status become files the handle polls), while
+   * Windows uses a long-lived exec stream. DSH 0.1.7-alpha.2 also routes every
+   * foreground call through this half — the jobs registry registers it at its
+   * start and awaits `result()` once it settles — so the handle carries the
+   * real exit code, split streams, `observed` readers, and `result()`, not just
+   * the legacy consuming `readOutput()` cursor.
+   */
   remoteStart(spec) {
     const policy = this.policy(spec)
     if (policy !== undefined && policy.mode !== 'danger-full-access') {
-      return {
-        status: 'completed',
-        exitCode: 1,
-        signal: null,
-        sandbox: { mode: policy.mode, denied: true },
-        readOutput() { return { delta: '', lossy: false } },
-        kill() { return false },
-        done: Promise.resolve(),
-      }
+      return this.settledExecution(this.deniedRemoteResult(spec, policy.mode))
     }
     const parsed = parseRemoteWorkdir(spec.workdir)
     const client = this.clientForRemote(parsed.host, parsed.user, parsed.port)
     const path = parsed.path
-    const log = `${path.replace(/\/+$/, '')}/.dsh-bg-${Date.now()}-${Math.floor(Math.random() * 1e6)}.log`
+    const id = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`
     // POSIX launcher. `setsid` puts the command in its OWN session and process
     // group, so the pid this script reports — `$!` — is that GROUP's leader and
     // `kill -TERM -<pid>` reaches the whole tree (see `reapPidCommand`). Without
@@ -339,41 +505,93 @@ export class SshShellExecutor {
     // `else` branch keeps hosts with no `setsid` utility (e.g. macOS) working,
     // where the group kill simply fails over to the single-pid form. stdin is
     // /dev/null so the job never depends on the (short-lived) exec channel.
+    //
+    // Streams go to separate files (not one `2>&1` log) because the harness
+    // reads stdout and stderr independently; a third file records the command's
+    // own `$?` so a settled job reports the REAL exit code. The directory is a
+    // per-command `mktemp -d`, so a foreground call never litters the remote
+    // workspace; the hidden workspace dir is only the fallback for a host with
+    // no usable temp directory.
+    const fallbackDir = `${path.replace(/\/+$/, '')}/.dsh-rw-${id}`
+    const inner = `${spec.command} > "$dir/out" 2> "$dir/err" </dev/null; echo $? > "$dir/exit"`
     const launcher = [
+      `dir=$(mktemp -d 2>/dev/null) || dir=${shellQuote(fallbackDir)}`,
+      'mkdir -p "$dir" 2>/dev/null || true',
+      'export dir',
+      "printf 'DWSH_DIR=%s\\n' \"$dir\"",
       'if command -v setsid >/dev/null 2>&1; then',
-      `setsid sh -c ${shellQuote(spec.command)} > ${shellQuote(log)} 2>&1 </dev/null &`,
+      `setsid sh -c ${shellQuote(inner)} > /dev/null 2>&1 </dev/null &`,
       'else',
-      `nohup sh -c ${shellQuote(spec.command)} > ${shellQuote(log)} 2>&1 </dev/null &`,
+      `nohup sh -c ${shellQuote(inner)} > /dev/null 2>&1 </dev/null &`,
       'fi',
       'echo $!',
     ].join('\n')
     const launchScript = `cd ${shellQuote(path)} || exit 1\n${launcher}`
 
     let pid = null
-    let offset = 0
-    let buffer = ''
-    let spawnError
+    let dir = null
+    let outBuf = ''
+    let errBuf = ''
+    let outBytes = 0
+    let errBytes = 0
+    let outLossy = false
+    let errLossy = false
+    let offsetOut = 0
+    let offsetErr = 0
+    let spawnFailure
+    let pendingFailureNote
+    let resultPromise
     let pollTimer
     let streamCtl = null
 
+    const failureText = () => `spawn failed: ${messageOf(spawnFailure)}`
+    const consumeFailureNote = () => { const note = pendingFailureNote ?? ''; pendingFailureNote = undefined; return note }
+    /** Retain the tail of one stream under its byte budget (lossy once it overflows). */
+    const appendOut = (text) => {
+      if (typeof text !== 'string' || text === '') return
+      outBytes += Buffer.byteLength(text, 'utf8')
+      const room = spec.stdoutMaxBytes - outBuf.length
+      if (room <= 0) { outLossy = true; return }
+      if (text.length > room) { outBuf += text.slice(text.length - room); outLossy = true }
+      else outBuf += text
+    }
+    const appendErr = (text) => {
+      if (typeof text !== 'string' || text === '') return
+      errBytes += Buffer.byteLength(text, 'utf8')
+      const room = DEFAULT_STDERR_MAX_BYTES - errBuf.length
+      if (room <= 0) { errLossy = true; return }
+      if (text.length > room) { errBuf += text.slice(text.length - room); errLossy = true }
+      else errBuf += text
+    }
+    /** A launch failure settles the handle killed and is reported once on stderr. */
+    const fail = (error) => {
+      spawnFailure = error
+      pendingFailureNote = `spawn failed: ${messageOf(error)}`
+      proc.status = 'killed'
+    }
     const proc = {
       status: 'running',
       exitCode: null,
       signal: null,
       sandbox: { mode: 'danger-full-access', denied: false },
+      observed: {
+        stdout: textReader(() => outBuf, () => outLossy),
+        stderr: textReader(() => (spawnFailure !== undefined && errBuf === '' ? failureText() : errBuf), () => errLossy),
+      },
       readOutput() {
-        const delta = buffer.slice(offset)
-        offset = buffer.length
+        const outDelta = outBuf.slice(offsetOut)
+        const errDelta = errBuf.slice(offsetErr)
+        offsetOut = outBuf.length
+        offsetErr = errBuf.length
         // A launch failure is reported through the job's stderr exactly once,
-        // mirroring localStart (and the Windows branch's own [stderr] merge).
-        // Without this the background job ended as an empty, reason-less
-        // result and the model could not tell why it never started.
-        const errText = spawnError === undefined ? '' : messageOf(spawnError)
-        spawnError = undefined
-        const separator = delta.length > 0 && !delta.endsWith('\n') ? '\n' : ''
+        // mirroring localStart. Without this the background job ended as an
+        // empty, reason-less result and the model could not tell why it never
+        // started.
+        const errText = errDelta.length > 0 ? errDelta : consumeFailureNote()
+        const separator = outDelta.length > 0 && !outDelta.endsWith('\n') ? '\n' : ''
         return {
-          delta: delta + (errText.length > 0 ? `${separator}[stderr]\n${errText}` : ''),
-          lossy: false,
+          delta: outDelta + (errText.length > 0 ? `${separator}[stderr]\n${errText}` : ''),
+          lossy: outLossy || errLossy,
         }
       },
       kill() {
@@ -386,13 +604,34 @@ export class SshShellExecutor {
         else if (pid !== null) void client.run(reapPidCommand(pid, 'posix'))
         return true
       },
+      /**
+       * The foreground projection DSH >= 0.1.7-alpha.2 awaits on the job it
+       * registered (`onExpiry: 'none'` arms no executor deadline, so `timedOut`
+       * stays false: the CALLER bounds its own wait and promotes at its own
+       * deadline). Memoized, and only created when asked for, so a background
+       * consumer never owns this promise's rejection.
+       */
+      result() {
+        return (resultPromise ??= proc.done.then(() => {
+          if (spawnFailure !== undefined) throw spawnFailure
+          return {
+            exitCode: proc.exitCode,
+            signal: proc.signal,
+            timedOut: false,
+            aborted: spec.signal?.aborted === true,
+            timeoutMs: spec.timeoutMs,
+            stdout: { text: outBuf, truncated: outLossy },
+            stderr: { text: errBuf, truncated: errLossy },
+            ...(proc.sandbox !== undefined ? { sandbox: proc.sandbox } : {}),
+          }
+        }))
+      },
       done: (async () => {
         const profile = await client.profile()
         if (profile.family === 'unknown') {
           // Never run the POSIX nohup launcher against an undetected host (a
           // Windows/cmd host would die on the `cd '…'` line with Win32 123).
-          spawnError = new Error(PROBE_UNKNOWN_MSG)
-          proc.status = 'killed'
+          fail(new Error(PROBE_UNKNOWN_MSG))
           return
         }
         if (profile.family === 'windows') {
@@ -400,20 +639,15 @@ export class SshShellExecutor {
           // channel alone does NOT reap the remote tree (verified) - so the
           // job is a long-lived exec stream whose terminate() actively
           // taskkill /T's the remote PID and then closes the channel.
-          const ctl = await client.execStream(spec.command, { cwd: path })
+          const ctl = await client.execStream(spec.command, {
+            cwd: path,
+            stdoutMaxBytes: spec.stdoutMaxBytes,
+          })
           if (proc.status !== 'running') { ctl.terminate(); return }
           streamCtl = ctl
           const merge = () => {
-            const outPart = ctl.readOut()
-            const errPart = ctl.readErr()
-            if (outPart.delta.length > 0) {
-              if (buffer.length > 0 && !buffer.endsWith('\n')) buffer += '\n'
-              buffer += outPart.delta
-            }
-            if (errPart.delta.length > 0) {
-              if (buffer.length > 0 && !buffer.endsWith('\n')) buffer += '\n'
-              buffer += '[stderr]\n' + errPart.delta
-            }
+            appendOut(ctl.readOut().delta)
+            appendErr(ctl.readErr().delta)
           }
           if (spec.signal !== undefined) {
             const onAbort = () => { if (streamCtl !== null) streamCtl.terminate() }
@@ -431,8 +665,7 @@ export class SshShellExecutor {
           merge()
           if (proc.status === 'running') proc.status = 'completed'
           if (outcome.error !== undefined) {
-            spawnError = new Error(outcome.error)
-            proc.status = 'killed'
+            fail(new Error(outcome.error))
             return
           }
           proc.exitCode = typeof outcome.exitCode === 'number' ? outcome.exitCode : null
@@ -440,46 +673,92 @@ export class SshShellExecutor {
         }
         const launched = await client.run(launchScript, { agentFacing: true })
         if (!launched.ok) {
-          spawnError = new Error((launched.stderr ?? '').trim() || launched.error || 'background spawn failed')
-          proc.status = 'killed'
+          fail(new Error((launched.stderr ?? '').trim() || launched.error || 'background spawn failed'))
           return
         }
-        const parsedPid = Number((launched.stdout ?? '').trim())
+        const lines = String(launched.stdout ?? '').split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== '')
+        const dirLine = lines.find((line) => line.startsWith('DWSH_DIR='))
+        const pidToken = [...lines].reverse().find((line) => /^\d+$/.test(line))
+        dir = dirLine === undefined ? null : dirLine.slice('DWSH_DIR='.length)
+        const parsedPid = pidToken === undefined ? NaN : Number(pidToken)
+        if (typeof dir !== 'string' || !dir.startsWith('/')) {
+          fail(new Error('background spawn failed: no temp directory'))
+          return
+        }
         if (!Number.isFinite(parsedPid) || parsedPid <= 0) {
-          spawnError = new Error('background spawn failed: no pid')
-          proc.status = 'killed'
+          fail(new Error('background spawn failed: no pid'))
+          await this.cleanupRemote(client, dir)
           return
         }
+        const outLog = `${dir}/out`
+        const errLog = `${dir}/err`
+        const exitLog = `${dir}/exit`
         pid = parsedPid
         // kill() can land while the launcher is still in flight; the pid is the
         // only handle on the remote tree, so reap it now rather than leaving a
         // "killed" job running on the remote.
         if (proc.status !== 'running') {
           await client.run(reapPidCommand(pid, 'posix'))
+          await this.cleanupRemote(client, dir)
           return
         }
-        // Poll the log into the buffer (readOutput stays synchronous).
+        // Poll both streams into the buffers (readOutput/observed stay
+        // synchronous) under their byte offsets.
+        const drain = async () => {
+          const [outTail, errTail] = await Promise.all([
+            client.run(`tail -c +${outBytes + 1} ${shellQuote(outLog)} 2>/dev/null || true`),
+            client.run(`tail -c +${errBytes + 1} ${shellQuote(errLog)} 2>/dev/null || true`),
+          ])
+          if (outTail.ok === true) appendOut(outTail.stdout)
+          if (errTail.ok === true) appendErr(errTail.stdout)
+        }
         const poll = async () => {
           if (proc.status !== 'running') return
-          const tail = await client.run(`tail -c +${offset + 1} ${shellQuote(log)} 2>/dev/null || true`)
-          if (tail.ok && tail.stdout) { buffer += tail.stdout; }
-          pollTimer = setTimeout(poll, 500)
+          await drain()
+          pollTimer = setTimeout(() => { void poll() }, 500)
         }
-        pollTimer = setTimeout(poll, 500)
-        // Poll pid liveness until it exits.
+        pollTimer = setTimeout(() => { void poll() }, 500)
+        // Poll pid liveness until it exits, then drain what the writers left.
         for (;;) {
           const alive = await client.run(`kill -0 ${pid} 2>/dev/null && echo yes || echo no`)
           if (alive.stdout?.trim() === 'no' || proc.status !== 'running') break
           await new Promise((r) => setTimeout(r, 500))
         }
-        if (proc.status === 'running') proc.status = 'completed'
         clearTimeout(pollTimer)
+        await drain()
+        if (proc.status === 'running') {
+          proc.exitCode = await this.readRemoteExit(client, exitLog)
+          proc.status = proc.exitCode === null ? 'killed' : 'completed'
+          if (proc.exitCode === null) pendingFailureNote = 'the remote command ended without reporting an exit status'
+        }
+        await this.cleanupRemote(client, dir)
       })().catch((error) => {
-        spawnError = error
-        proc.status = 'killed'
+        fail(error)
       }),
     }
     return proc
+  }
+
+  /**
+   * The detached POSIX launcher records the command's own `$?` in `<dir>/exit`
+   * as it exits, so a settled job reports the REAL exit code (the poll-only
+   * handle reported `null`). A few short retries cover the writer racing the
+   * liveness probe.
+   */
+  async readRemoteExit(client, exitLog) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const res = await client.run(`cat ${shellQuote(exitLog)} 2>/dev/null || true`)
+      const text = String(res.stdout ?? '').trim()
+      if (/^-?\d+$/.test(text)) return Number(text)
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    return null
+  }
+
+  /** Remove the per-command temp directory a detached POSIX launch created. */
+  async cleanupRemote(client, dir) {
+    if (typeof dir !== 'string' || !dir.startsWith('/')) return
+    try { await client.run(`rm -rf ${shellQuote(dir)} 2>/dev/null || true`) } catch { /* already gone */ }
   }
 
   // -------------------------------------------------------------------------
@@ -591,16 +870,60 @@ export class SshShellExecutor {
     const subprocess = this.getSubprocess()
     if (!subprocess) throw new Error('subprocess service unavailable')
     const confined = await this.confine(this.argv(spec), policy, spec.signal)
-    const running = subprocess.spawn(this.spawnSpec(spec, confined.argv, DEFAULT_STDOUT_MAX_BYTES, spec.signal))
+    const running = subprocess.spawn(this.spawnSpec(spec, confined.argv, spec.stdoutMaxBytes, spec.signal))
     const { stdout, stderr } = running.collected
-    let spawnFailureNote
-    const consumeSpawnFailure = () => { const n = spawnFailureNote ?? ''; spawnFailureNote = undefined; return n }
+    let spawnFailure
+    let pendingFailureNote
+    let resultPromise
+    const finalOutput = this.finalOutput.bind(this)
+    const failureText = () => `spawn failed: ${messageOf(spawnFailure)}`
+    const failureReaderText = () => {
+      const base = stderr ? stderr.readFrom(0).text : ''
+      if (base === '') return failureText()
+      return `${base}${base.endsWith('\n') ? '' : '\n'}${failureText()}`
+    }
+    const consumeFailureNote = () => { const n = pendingFailureNote ?? ''; pendingFailureNote = undefined; return n }
     let outOffset = 0
     let errOffset = 0
     const proc = {
       status: 'running',
       exitCode: null,
       signal: null,
+      observed: {
+        stdout: stdout !== undefined ? stdout : textReader(() => ''),
+        // A rejected spawn produced no output, so its stderr stream IS the
+        // failure note (the harness's own local executors report it the same
+        // way); it must survive the consuming readOutput() cursor.
+        stderr: {
+          readFrom(fromByte) {
+            if (spawnFailure === undefined) {
+              return stderr !== undefined ? stderr.readFrom(fromByte) : { text: '', nextOffset: fromByte, lossy: false }
+            }
+            return textReader(failureReaderText).readFrom(fromByte)
+          },
+        },
+      },
+      /**
+       * The foreground projection DSH >= 0.1.7-alpha.2 awaits on the job it
+       * registered. `onExpiry: 'none'` arms no executor deadline, so `timedOut`
+       * stays false: the CALLER bounds its own wait. Memoized, and only created
+       * when asked for, so a background consumer never owns its rejection.
+       */
+      result() {
+        return (resultPromise ??= proc.done.then(() => {
+          if (spawnFailure !== undefined) throw spawnFailure
+          return {
+            exitCode: proc.exitCode,
+            signal: proc.signal,
+            timedOut: false,
+            aborted: spec.signal?.aborted === true,
+            timeoutMs: spec.timeoutMs,
+            stdout: stdout !== undefined ? finalOutput(stdout) : { text: '', truncated: false },
+            stderr: stderr !== undefined ? finalOutput(stderr) : { text: '', truncated: false },
+            ...(proc.sandbox !== undefined ? { sandbox: proc.sandbox } : {}),
+          }
+        }))
+      },
       done: running.done.then((outcome) => {
         if (proc.status === 'running') {
           proc.status = spec.signal?.aborted === true || outcome.signal !== null ? 'killed' : 'completed'
@@ -616,14 +939,15 @@ export class SshShellExecutor {
         }
       }, (error) => {
         proc.status = 'killed'
-        spawnFailureNote = `spawn failed: ${messageOf(error)}`
+        spawnFailure = error
+        pendingFailureNote = `spawn failed: ${messageOf(error)}`
       }),
       readOutput() {
         const out = stdout ? stdout.readFrom(outOffset) : { text: '', nextOffset: 0, lossy: false }
         const err = stderr ? stderr.readFrom(errOffset) : { text: '', nextOffset: 0, lossy: false }
         outOffset = out.nextOffset
         errOffset = err.nextOffset
-        const errText = err.text.length > 0 ? err.text : consumeSpawnFailure()
+        const errText = err.text.length > 0 ? err.text : consumeFailureNote()
         const separator = out.text.length > 0 && !out.text.endsWith('\n') ? '\n' : ''
         return {
           delta: out.text + (errText.length > 0 ? `${separator}[stderr]\n${errText}` : ''),
