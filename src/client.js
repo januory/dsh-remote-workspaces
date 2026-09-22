@@ -1388,22 +1388,55 @@ function unwrapRemote(res) {
 
       var mount = ctx.remote.$mount({ package: PACKAGE, descriptors: INVOCATIONS })
       var getRemote = function () { return ctx.get('remote.' + NAMESPACE) }
-      var getCwd = function () {
+      /**
+       * The CURRENT main-view session id.
+       *
+       * DSH 0.1.7 removed `current` from the session-list snapshot
+       * (`SessionListState` is now `{ ids, byId, phase, projectionsBySession }`;
+       * core commit 6830e1460d), so `snap.current` silently became `undefined`
+       * here and every seat lost its session: `getCwd()` returned nothing and
+       * `openShellAt('')` opened a LOCAL shell at the harness process cwd
+       * instead of one on the remote host. The selection now lives on
+       * `ctx.uiSession`, whose adapter publishes the main-view binding
+       * (`ui-session` client, `publishMain`); fall back to the same retention
+       * marker that service uses (`retainedBy.mainView`) for a composition
+       * without it.
+       */
+      var currentSessionId = function () {
+        try {
+          var ui = typeof ctx.get === 'function' ? ctx.get('uiSession') : undefined
+          var source = ui && ui.adapter ? ui.adapter.current : undefined
+          var binding = source && typeof source.getSnapshot === 'function' ? source.getSnapshot() : undefined
+          var key = binding && binding.key
+          if (typeof key === 'string' && key !== '') return key
+        } catch (e) { /* fall through to the retention scan */ }
         try {
           var sessions = ctx.sessions
           if (!sessions || !sessions.list || typeof sessions.list.getSnapshot !== 'function') return undefined
           var snap = sessions.list.getSnapshot()
-          var id = snap && snap.current
-          var row = id && snap.byId ? snap.byId[id] : undefined
+          if (!snap || !Array.isArray(snap.ids) || !snap.byId) return undefined
+          for (var i = 0; i < snap.ids.length; i++) {
+            var row = snap.byId[snap.ids[i]]
+            if (row && row.retainedBy && row.retainedBy.mainView > 0) return String(snap.ids[i])
+          }
+          return undefined
+        } catch (e) { return undefined }
+      }
+      var getCwd = function () {
+        try {
+          var id = currentSessionId()
+          if (id === undefined) return undefined
+          var sessions = ctx.sessions
+          if (!sessions || !sessions.list || typeof sessions.list.getSnapshot !== 'function') return undefined
+          var snap = sessions.list.getSnapshot()
+          var row = snap && snap.byId ? snap.byId[id] : undefined
           return row ? row.cwd : undefined
         } catch (e) { return undefined }
       }
       var getSessionId = function () {
         try {
-          var sessions = ctx.sessions
-          if (!sessions || !sessions.list || typeof sessions.list.getSnapshot !== 'function') return undefined
-          var snap = sessions.list.getSnapshot()
-          return snap && snap.current ? String(snap.current) : undefined
+          var id = currentSessionId()
+          return id === undefined ? undefined : String(id)
         } catch (e) { return undefined }
       }
 

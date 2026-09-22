@@ -91,11 +91,16 @@ check('the client half still injects the sidebar seats', Array.isArray(plugin.in
 const registrations = []
 const tabTypes = []
 const disposed = []
+// DSH 0.1.7 removed `current` from the session-list snapshot; the selection now
+// lives on `ctx.uiSession`. Both sources are mutable so the fallback and the
+// no-session case can be exercised below.
+let uiSession = { adapter: { current: { getSnapshot: () => ({ key: 'sess-9' }) } } }
+let sessionSnapshot = { ids: ['sess-9'], byId: { 'sess-9': { id: 'sess-9', cwd: '/remote/workspace' } } }
 const ctx = {
   effect: (fn) => { const d = fn(); disposed.push(d); return () => { if (typeof d === 'function') d() } },
-  get: () => undefined,
+  get: (name) => (name === 'uiSession' ? uiSession : undefined),
   remote: { $mount: () => ({}) },
-  sessions: {},
+  sessions: { list: { getSnapshot: () => sessionSnapshot } },
   sidebarRightTabs: { register: (spec) => { tabTypes.push(spec); return () => {} } },
   slots: {
     inject: (_name, fn) => { fn(); return () => {} },
@@ -124,6 +129,36 @@ check('the Shell chip title registers into sidebar.right.pane.tab.title', shellT
 check('both seats use the SAME type id (the seat dispatches on it, not on the kind)', shellBody !== undefined && shellTitle !== undefined)
 check('the chip title seat injects getSessionId (keys the live shell label)',
   typeof shellTitle.spec.inject === 'function' && typeof shellTitle.spec.inject().getSessionId === 'function')
+
+// --- the current session actually resolves (0.1.7 removed snapshot.current) --
+// Regression: `sessions.list.getSnapshot().current` no longer exists, so the
+// seats silently saw no session, sent `cwd: ''`, and the host opened a LOCAL
+// shell instead of one on the remote workspace.
+const titleInject = shellTitle.spec.inject()
+const bodyInject = shellBody.spec.inject()
+check('the seat reads the current session from ctx.uiSession',
+  titleInject.getSessionId() === 'sess-9', String(titleInject.getSessionId()))
+check('the shell body sends that session\'s cwd to openShellAt',
+  bodyInject.getCwd() === '/remote/workspace', String(bodyInject.getCwd()))
+check('the body and title agree on the session key', titleInject.getSessionId() === bodyInject.getSessionId())
+// A composition without uiSession falls back to the same retention marker the
+// core's own publishMain uses (`retainedBy.mainView`).
+uiSession = undefined
+sessionSnapshot = {
+  ids: ['sess-1', 'sess-2'],
+  byId: {
+    'sess-1': { id: 'sess-1', cwd: '/other', retainedBy: { mainView: 0 } },
+    'sess-2': { id: 'sess-2', cwd: '/main', retainedBy: { mainView: 1 } },
+  },
+}
+check('without uiSession the main-view retention marker still resolves the session',
+  titleInject.getSessionId() === 'sess-2' && bodyInject.getCwd() === '/main',
+  JSON.stringify({ id: titleInject.getSessionId(), cwd: bodyInject.getCwd() }))
+// No session at all: undefined, which the body spells as '' for the gateway.
+sessionSnapshot = { ids: [], byId: {} }
+check('with no session selected the seats report nothing (cwd falls back to \'\')',
+  titleInject.getSessionId() === undefined && bodyInject.getCwd() === undefined,
+  JSON.stringify({ id: titleInject.getSessionId(), cwd: bodyInject.getCwd() }))
 
 // --- the title really draws a glyph before the live label -------------------
 // One element→component pass, the way React resolves a function component
