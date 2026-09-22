@@ -17,7 +17,10 @@ function fakeHandle(pid = 12345) {
     pid,
     write(data) { calls.writes.push(data) },
     terminate() { calls.terminated = true; return Promise.resolve() },
-    resize(r, c) { calls.resizes.push([r, c]) },
+    // Records the two arguments verbatim: the LOCAL seam handle is
+    // `resize(cols, rows)` (the harness's subprocess contract) while the
+    // plugin's own remote ssh2 wrapper is `resize(rows, cols)`.
+    resize(a, b) { calls.resizes.push([a, b]) },
     calls,
   }
 }
@@ -56,6 +59,8 @@ const handle1 = localHandle
 check('openLocal returns id/pid/kind', Boolean(local.id) && local.pid === 12345 && local.kind === 'local', JSON.stringify(local))
 check('openLocal names the local shell', local.shell === (process.platform === 'win32' ? 'PowerShell' : 'bash'), JSON.stringify(local.shell))
 check('spawnTerminal got rows/cols', spawnSpecs[0].rows === 30 && spawnSpecs[0].cols === 100, JSON.stringify({ rows: spawnSpecs[0].rows, cols: spawnSpecs[0].cols }))
+check('spawnTerminal declares the terminal type the seam requires',
+  spawnSpecs[0].terminalType === 'xterm-256color', JSON.stringify(spawnSpecs[0].terminalType))
 check('spawnTerminal argv non-empty', Array.isArray(spawnSpecs[0].argv) && spawnSpecs[0].argv.length > 0, JSON.stringify(spawnSpecs[0].argv))
 
 // ---------------------------------------------------------------------------
@@ -71,7 +76,10 @@ check('read drains buffered bytes', r1.text === 'hello world' && r1.eof === fals
 check('read is destructive', shells.read(local.id).text === '')
 
 const rs = await shells.resize(local.id, 40, 120)
-check('resize routes to handle.resize', rs.resized === true && localHandle.calls.resizes.length === 1 && localHandle.calls.resizes[0][0] === 40 && localHandle.calls.resizes[0][1] === 120, JSON.stringify(localHandle.calls.resizes))
+check('resize routes to handle.resize in the seam\'s (cols, rows) order',
+  rs.resized === true && localHandle.calls.resizes.length === 1
+  && localHandle.calls.resizes[0][0] === 120 && localHandle.calls.resizes[0][1] === 40,
+  JSON.stringify(localHandle.calls.resizes))
 
 // ---------------------------------------------------------------------------
 // EOF marking on channel close.
@@ -90,7 +98,10 @@ const remote = await shells.openRemote(machine, { rows: 25, cols: 90 })
 check('openRemote returns id/pid=null/kind', Boolean(remote.id) && remote.pid === null && remote.kind === 'remote', JSON.stringify(remote))
 check('openRemote carries the login shell name from the channel handle', remote.shell === 'zsh', JSON.stringify(remote.shell))
 check('openRemote forwards machine + opts', remoteArgs.machine === machine && remoteArgs.opts.rows === 25 && remoteArgs.opts.cols === 90)
-check('remote resize uses setWindow', (await shells.resize(remote.id, 50, 130)).resized === true && remoteHandle.calls.resizes[0][0] === 50)
+check('remote resize keeps the ssh2 (rows, cols) order',
+  (await shells.resize(remote.id, 50, 130)).resized === true
+  && remoteHandle.calls.resizes[0][0] === 50 && remoteHandle.calls.resizes[0][1] === 130,
+  JSON.stringify(remoteHandle.calls.resizes))
 
 // ---------------------------------------------------------------------------
 // list + close + isolation.

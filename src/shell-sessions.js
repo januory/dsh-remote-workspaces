@@ -101,7 +101,18 @@ export function createShellSessions({ getSubprocess, openRemote: openRemoteChann
     const cwd = typeof opts.cwd === 'string' && opts.cwd !== '' ? opts.cwd : process.cwd()
     const rows = Number.isInteger(opts.rows) && opts.rows > 0 ? opts.rows : 24
     const cols = Number.isInteger(opts.cols) && opts.cols > 0 ? opts.cols : 80
-    const handle = await subprocess.spawnTerminal({ argv, cwd, rows, cols, graceMs: 3000 })
+    const handle = await subprocess.spawnTerminal({
+      argv,
+      cwd,
+      rows,
+      cols,
+      // Required by the subprocess seam: the emulation advertised to the child
+      // through `name`/`TERM` (packages/subprocess/subprocess/src/types.ts). The
+      // harness's own terminal controller uses the same value; omitting it left
+      // TERM inherited from the harness process instead of declared.
+      terminalType: 'xterm-256color',
+      graceMs: 3000,
+    })
     const shell = win ? 'PowerShell' : 'bash'
     const session = register(handle, { kind: 'local', label: '本机', shell }, key)
     return { id: session.id, pid: handle.pid, kind: 'local', shell, attached: false }
@@ -157,7 +168,14 @@ export function createShellSessions({ getSubprocess, openRemote: openRemoteChann
     const session = requireSession(id)
     if (session.ended) return { resized: false }
     if (typeof session.handle.resize === 'function') {
-      session.handle.resize(rows, cols)
+      // The two seams disagree on argument order, so each handle is called in
+      // its own: the harness's subprocess terminal handle is `resize(cols, rows)`
+      // (packages/subprocess/subprocess/src/types.ts, called that way by
+      // terminal-controller), while this plugin's ssh2 wrapper is
+      // `resize(rows, cols)` (ssh2 `stream.setWindow(rows, cols)`). Passing the
+      // plugin's `(rows, cols)` to both transposed every local-seam resize.
+      if (session.meta.kind === 'local') await session.handle.resize(cols, rows)
+      else session.handle.resize(rows, cols)
       return { resized: true }
     }
     return { resized: false }
