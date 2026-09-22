@@ -115,6 +115,41 @@ const shres = await ex.run(shspec)
 check('shell remote run pwd', shres.exitCode === 0 && shres.stdout.text.trim() === REMOTE_DIR, shres.stdout.text.trim())
 
 // ---------------------------------------------------------------------------
+// 4b. The unified execute() handle (DSH >= 0.1.7). With a jobs registry — the
+// web app — EVERY foreground call arrives as `onExpiry: 'none'`, so this is the
+// shape real usage runs. Regression (measured here): the POSIX launcher's
+// redirects must wrap the WHOLE command list; `${cmd} > out` bound them to the
+// list's last simple command, silently dropping every earlier command's output.
+// ---------------------------------------------------------------------------
+{
+  const handle = await ex.execute(ex.resolve({
+    command: 'printf "one\\ntwo\\n"; echo three; echo warn-me >&2',
+    workdir: anchor,
+    onExpiry: 'none',
+  }))
+  await handle.done
+  const result = await handle.result()
+  check('execute(none) captures the WHOLE command list',
+    result.stdout.text === 'one\ntwo\nthree\n', JSON.stringify(result.stdout.text))
+  check('execute(none) splits stderr from stdout',
+    result.stderr.text === 'warn-me\n', JSON.stringify(result.stderr.text))
+  check('execute(none) settles completed with exit 0',
+    handle.status === 'completed' && result.exitCode === 0 && result.timedOut === false,
+    JSON.stringify({ status: handle.status, exitCode: result.exitCode }))
+  check('the observed stream serves the same output to the job pump',
+    handle.observed.stdout.readFrom(0).text === 'one\ntwo\nthree\n',
+    JSON.stringify(handle.observed.stdout.readFrom(0)))
+}
+{
+  const handle = await ex.execute(ex.resolve({ command: 'echo one; echo two; exit 7', workdir: anchor, onExpiry: 'none' }))
+  await handle.done
+  const result = await handle.result()
+  check('execute(none) reports a command ending in `exit N` with its real code',
+    result.exitCode === 7 && result.stdout.text === 'one\ntwo\n',
+    JSON.stringify({ exitCode: result.exitCode, stdout: result.stdout.text }))
+}
+
+// ---------------------------------------------------------------------------
 // 5. grep / glob: search tools run ripgrep on the remote via the anchor cwd.
 // ---------------------------------------------------------------------------
 const deps = { clientForRemote: () => client, getSubprocess: () => { throw new Error('not used remotely') } }

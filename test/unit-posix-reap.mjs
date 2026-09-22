@@ -136,7 +136,16 @@ check('the fake host probes as a POSIX remote', profile.family === 'posix', JSON
   const launched = await waitFor(() => launchScript !== '')
   check('the POSIX launcher reached the remote', launched, launchScript.split('\n')[0])
   check('the launcher runs the command under setsid (own session + process group)',
-    launchScript.includes("setsid sh -c 'sleep 300 > \"$dir/out\""), JSON.stringify(launchScript))
+    launchScript.includes("setsid sh -c '(\nsleep 300\n) > \"$dir/out\""), JSON.stringify(launchScript))
+  // Regression (measured on a real host): the redirects must wrap the WHOLE
+  // command list. `${cmd} > out` binds them to the list's LAST simple command
+  // (`echo a; echo b > out` captures only `b` and sends `a` to the launcher's
+  // /dev/null), which silently dropped every earlier command's output. The
+  // subshell also keeps a command ending in `exit N` from terminating the
+  // status writer before it records `$?`.
+  check('the stream redirects wrap the whole command list, not its last command',
+    launchScript.includes('setsid sh -c \'(\nsleep 300\n) > "$dir/out" 2> "$dir/err" </dev/null; echo $? > "$dir/exit"\''),
+    JSON.stringify(launchScript.split('\n').slice(6, 11)))
   check('the launcher keeps a nohup fallback for hosts without setsid', launchScript.includes('command -v setsid') && launchScript.includes('nohup sh -c'), JSON.stringify(launchScript.split('\n').slice(0, 6)))
   check('the launcher still reports the pid it recorded', launchScript.trim().endsWith('echo $!'), JSON.stringify(launchScript.trim().split('\n').slice(-1)[0]))
   check('the job is detached from the exec channel stdin', launchScript.includes('</dev/null'), JSON.stringify(launchScript))

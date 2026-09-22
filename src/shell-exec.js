@@ -557,7 +557,14 @@ export class SshShellExecutor {
     // workspace; the hidden workspace dir is only the fallback for a host with
     // no usable temp directory.
     const fallbackDir = `${path.replace(/\/+$/, '')}/.dsh-rw-${id}`
-    const inner = `${spec.command} > "$dir/out" 2> "$dir/err" </dev/null; echo $? > "$dir/exit"`
+    // The command rides inside a SUBSHELL so the redirects bind to the WHOLE
+    // command list. `${spec.command} > "$dir/out"` would bind them to the list's
+    // LAST simple command only — `printf A; echo B > out` captures just `B` and
+    // sends `A` to the launcher's /dev/null — silently dropping the output of
+    // everything before it (measured against a real host). The subshell also
+    // keeps a command that ends in `exit N` from terminating the status writer
+    // before it records `$?`, so the job reports the real exit code.
+    const inner = `(\n${spec.command}\n) > "$dir/out" 2> "$dir/err" </dev/null; echo $? > "$dir/exit"`
     const launcher = [
       `dir=$(mktemp -d 2>/dev/null) || dir=${shellQuote(fallbackDir)}`,
       'mkdir -p "$dir" 2>/dev/null || true',
