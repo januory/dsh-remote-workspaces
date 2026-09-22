@@ -212,16 +212,30 @@ function formatGlob(paths) {
 // Tool construction + registration
 // ---------------------------------------------------------------------------
 export function createSearchTools(deps) {
-  function resolveWorld(exec) {
+  /**
+   * The world one search runs in. The SESSION cwd decides first (a remote
+   * workspace session searches its own host), and a registered anchor named by
+   * the search path is the fallback — the exact precedence `ctx.fs` already
+   * applies (`RoutingFileSystem.routeRemote`: session cwd, then path alias).
+   *
+   * Without the fallback `read`/`write`/`edit` route an anchor path over SFTP
+   * while `grep`/`glob` run the LOCAL ripgrep against a directory that only
+   * exists on the remote, so the model sees "read works, grep says the path does
+   * not exist". The local anchor directory is empty by design, so searching it
+   * locally can never be the intent.
+   */
+  function resolveWorld(exec, input) {
     const cwd = exec.agent?.session.header.cwd
-    const hit = cwd ? findByCwd(cwd) : undefined
+    const sessionHit = cwd ? findByCwd(cwd) : undefined
+    const pathHit = sessionHit === undefined && typeof input?.path === 'string' ? findByCwd(input.path) : undefined
+    const hit = sessionHit ?? pathHit
     if (hit === undefined) return { local: true, cwd: cwd ?? process.cwd() }
     const remoteCwd = hit.remoteSubpath === '' ? hit.remotePath : posix.join(hit.remotePath, hit.remoteSubpath)
     return { local: false, remoteCwd, client: deps.clientForRemote(hit.host, hit.user, hit.port) }
   }
 
   async function runRg(exec, buildArgv, input) {
-    const world = resolveWorld(exec)
+    const world = resolveWorld(exec, input)
     if (world.local) return localRg(deps, buildArgv(input), world.cwd, exec.signal)
     const remoteInput = input.path !== undefined
       ? { ...input, path: translatePath(input.path) }
