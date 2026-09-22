@@ -203,7 +203,63 @@ const specFor = (ex, extra = {}) => ex.resolve({
     JSON.stringify(proc.sandbox))
 }
 
-// --- 7. cancellation and preparation timeout reach the provider -------------
+// --- 7. runner failure outranks a denial (0.1.7 runnerFailureRules) ---------
+{
+  const provider = {
+    async confine(argv) {
+      return {
+        argv: ['runner', '--', ...argv],
+        enforcement: 'full',
+        denialSignatures: ['permission denied'],
+        runnerFailureRules: [{
+          allowedExitCodes: [1],
+          informationalLines: ['runner: warming up'],
+          fatalSignatures: ['setting up uid map: permission denied'],
+        }],
+      }
+    },
+  }
+  const ex = makeExecutor(provider, fakeSubprocess({ exitCode: 1, stderrText: 'runner: warming up\nbwrap: setting up uid map: Permission denied' }))
+  const caught = await ex.run(specFor(ex)).then(() => undefined, (error) => error)
+  check('a fatal runner line is infrastructure, not a command result',
+    caught !== undefined && caught.code === 'SANDBOX_UNAVAILABLE', String(caught && caught.message))
+  check('the runner-failure error carries the matched line (informational lines excluded)',
+    caught !== undefined && caught.message.includes('setting up uid map') && !caught.message.includes('warming up'),
+    String(caught && caught.message))
+}
+{
+  // The same denial stderr with NO runner evidence stays an ordinary denial.
+  const provider = {
+    async confine(argv) {
+      return { argv: ['runner', '--', ...argv], enforcement: 'full', denialSignatures: ['permission denied'], runnerFailureRules: [] }
+    },
+  }
+  const ex = makeExecutor(provider, fakeSubprocess({ exitCode: 1, stderrText: 'bash: /etc/x: Permission denied' }))
+  const result = await ex.run(specFor(ex))
+  check('without runner evidence the run is still classified denied', result.sandbox?.denied === true, JSON.stringify(result.sandbox))
+}
+// --- 8. the background handle reports runnerFailed as a FACT, not a denial --
+{
+  const provider = {
+    async confine(argv) {
+      return {
+        argv: ['runner', '--', ...argv],
+        enforcement: 'full',
+        denialSignatures: [],
+        runnerFailureRules: [{ fatalSignatures: ['UID map setup failed'] }],
+      }
+    },
+  }
+  const ex = makeExecutor(provider, fakeSubprocess({ exitCode: 1, stderrText: 'bwrap: UID map setup failed' }))
+  const proc = await ex.start(specFor(ex))
+  await proc.done
+  check('the handle stamps runnerFailed and does not claim a denial',
+    proc.sandbox?.runnerFailed === true && proc.sandbox?.denied === false, JSON.stringify(proc.sandbox))
+  const result = await proc.result()
+  check('result() carries the same runner-failure fact', result.sandbox?.runnerFailed === true, JSON.stringify(result.sandbox))
+}
+
+// --- 9. cancellation and preparation timeout reach the provider -------------
 {
   const provider = {
     confine(_argv, _policy, signal) {

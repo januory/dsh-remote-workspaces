@@ -63,6 +63,50 @@ function matchesSignature(exitCode, stderr, signatures) {
   return signatures.some((s) => lowered.includes(String(s).toLowerCase()))
 }
 
+/**
+ * Mirror of the harness's `classifyRunnerFailure`
+ * (`packages/sandbox/sandbox/src/diagnostics.ts`). DSH 0.1.7 hands the selected
+ * backend's structured `runnerFailureRules` back from `confine()`: a runner
+ * that failed BEFORE executing the command produces fatal stderr evidence,
+ * which must outrank a policy denial (the command never ran) and gate the
+ * denial signatures behind it. Each rule needs a nonzero exit (optionally
+ * listed in `allowedExitCodes`), informational lines excluded by exact
+ * case-insensitive equality, then a fatal signature on one remaining line.
+ */
+function classifyRunnerFailure(exitCode, stderr, rules) {
+  if (exitCode === null || exitCode === undefined || exitCode === 0) return undefined
+  const lines = String(stderr).split(/\r?\n/)
+  for (const rule of rules ?? []) {
+    if (rule.allowedExitCodes !== undefined && !rule.allowedExitCodes.includes(exitCode)) continue
+    const informational = new Set((rule.informationalLines ?? []).map((line) => String(line).toLowerCase()))
+    const fatal = (rule.fatalSignatures ?? [])
+      .filter((signature) => String(signature).trim().length > 0)
+      .map((signature) => String(signature).toLowerCase())
+    for (const line of lines) {
+      const lowered = line.toLowerCase()
+      if (informational.has(lowered)) continue
+      if (fatal.some((signature) => lowered.includes(signature))) return { detail: line }
+    }
+  }
+  return undefined
+}
+
+/**
+ * A runner failure is infrastructure, not a command result. The harness throws
+ * a `SandboxUnavailableError` here (`@deepseek-ai/dsh-sandbox`); this plugin
+ * cannot import it without dual-packaging the harness, so the plain error
+ * carries the same name and stable code for structured consumers.
+ */
+function runnerFailureError(mode, detail) {
+  const error = new Error(
+    `sandbox mode "${mode}" was requested but the sandbox runner failed before the command could run; `
+    + `refusing to run the command unconfined. Runner failure: ${detail}`,
+  )
+  error.name = 'SandboxUnavailableError'
+  error.code = 'SANDBOX_UNAVAILABLE'
+  return error
+}
+
 function messageOf(error) {
   return error instanceof Error ? error.message : String(error)
 }
@@ -786,7 +830,7 @@ export class SshShellExecutor {
    */
   async confine(argv, policy, signal) {
     if (policy === undefined || policy.mode === 'danger-full-access') {
-      return { argv, enforcement: undefined, denialSignatures: [] }
+      return { argv, enforcement: undefined, denialSignatures: [], runnerFailureRules: [] }
     }
     const sandbox = this.getSandbox()
     if (!sandbox) throw new Error('sandbox backend unavailable: refusing to run unconfined')
@@ -843,6 +887,12 @@ export class SshShellExecutor {
     const aborted = d.signal.aborted && !timedOut
     d.dispose()
     const { stdout, stderr } = handle.collected
+    const stderrText = stderr?.readFrom(0).text ?? ''
+    // Runner failure outranks denial because the command did not run — the
+    // harness's own bash/pwsh sandbox executors throw here rather than return a
+    // result (packages/shell/bash-sandbox/src/index.ts).
+    const runnerFailure = classifyRunnerFailure(outcome.exitCode, stderrText, confined.runnerFailureRules)
+    if (runnerFailure !== undefined) throw runnerFailureError(policy.mode, runnerFailure.detail)
     return {
       ...outcome,
       timedOut,
@@ -853,7 +903,7 @@ export class SshShellExecutor {
       ...(policy !== undefined && policy.mode !== 'danger-full-access' ? {
         sandbox: {
           mode: policy.mode,
-          denied: matchesSignature(outcome.exitCode, stderr?.readFrom(0).text ?? '', confined.denialSignatures),
+          denied: matchesSignature(outcome.exitCode, stderrText, confined.denialSignatures),
           enforcement: confined.enforcement,
         },
       } : {}),
@@ -931,10 +981,17 @@ export class SshShellExecutor {
         proc.exitCode = outcome.exitCode
         proc.signal = outcome.signal
         if (policy !== undefined && policy.mode !== 'danger-full-access') {
+          const stderrText = stderr?.readFrom(0).text ?? ''
+          // The handle path reports the failure as a FACT (`sandbox.runnerFailed`)
+          // instead of rejecting, mirroring `onProcessDone` in the harness's own
+          // sandbox executors; the job/foreground renderers turn it into the
+          // "the sandbox runner itself failed" notice.
+          const runnerFailure = classifyRunnerFailure(outcome.exitCode, stderrText, confined.runnerFailureRules)
           proc.sandbox = {
             mode: policy.mode,
-            denied: matchesSignature(outcome.exitCode, stderr?.readFrom(0).text ?? '', confined.denialSignatures),
+            denied: runnerFailure === undefined && matchesSignature(outcome.exitCode, stderrText, confined.denialSignatures),
             enforcement: confined.enforcement,
+            ...(runnerFailure !== undefined ? { runnerFailed: true } : {}),
           }
         }
       }, (error) => {
