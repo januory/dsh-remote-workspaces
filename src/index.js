@@ -21,7 +21,7 @@ export { loadMachines, sanitizeMachine, upsertMachine, removeMachine, machinesPa
 export { registerAnchor, unregisterAnchor, findByCwd, loadAnchors } from './registry.js'
 
 /**
- * Host half of the SSH remote workspace bundle (`dsh-remote-workspaces`).
+ * Host half of the SSH remote workspace bundle (`@januory/dsh-remote-workspaces`).
  *
  * Publishes the routing `ctx.fs` and `ctx.shell` (local half sandboxed through
  * the harness's policy/sandbox/subprocess services; remote half SFTP/ssh2 exec),
@@ -37,7 +37,7 @@ export const name = 'dsh-remote-workspaces'
 // ---------------------------------------------------------------------------
 // Remote contract. The client half (src/client.js) keeps an identical copy.
 // ---------------------------------------------------------------------------
-const PACKAGE = 'dsh-remote-workspaces'
+const PACKAGE = '@januory/dsh-remote-workspaces'
 const NAMESPACE = 'remoteWorkspaces'
 
 // A strict codec must carry a `schema` with `parse()`: the Typert registry

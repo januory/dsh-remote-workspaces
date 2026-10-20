@@ -46,16 +46,8 @@ The full remote path is encoded into the anchor name (path separators and Window
 
 ## Installation
 
-Install from this repository:
-
 ```sh
-dsh plugin --profile web add github:januory/dsh-remote-workspaces
-```
-
-Once published to npm, install the released package directly:
-
-```sh
-dsh plugin --profile web add dsh-remote-workspaces
+dsh plugin --profile web add @januory/dsh-remote-workspaces
 ```
 
 Install from source:
@@ -73,10 +65,10 @@ dsh plugin --profile web add .
 Remove it with:
 
 ```sh
-dsh plugin --profile web remove dsh-remote-workspaces
+dsh plugin --profile web remove @januory/dsh-remote-workspaces
 ```
 
-> Maintainer note: the npm package name is now `dsh-remote-workspaces` (the early git install used `remote-workspaces`); older installs must first run `dsh plugin --profile <name> remove remote-workspaces`, then install under the new name.
+> Maintainer note: the npm package name is `@januory/dsh-remote-workspaces`; the unscoped `dsh-remote-workspaces` is still published every release as an alias so existing installs keep upgrading, and the early git install used `remote-workspaces`. Older installs under a retired name must first run `dsh plugin --profile <name> remove <old-name>`, then install under the current name.
 
 ## Usage
 
@@ -128,9 +120,11 @@ pnpm test:integration
 
 ## Publishing (maintainers)
 
-Releases are fully manual with **zero input**: the version comes straight from `package.json` — commit the new `version` on `main` first, then GitHub Actions → **release** → **Run workflow**. The workflow runs the unit tests (`npm test`), guards that the `v<version>` tag does not exist yet (prevents duplicate releases), publishes to npm with provenance (`npm publish --provenance`), creates and pushes the `v<version>` tag, and creates a GitHub Release with `--generate-notes`.
+Releases are fully manual with **zero input**: the version comes straight from `package.json` — commit the new `version` on `main` first, then GitHub Actions → **release** → **Run workflow**. The workflow runs the unit tests (`npm test`), guards that the `v<version>` tag does not exist yet (prevents duplicate releases), publishes to npm with provenance (`npm publish --provenance`), publishes the same version a second time under the legacy unscoped name `dsh-remote-workspaces` so existing installs keep upgrading, creates and pushes the `v<version>` tag, and creates a GitHub Release with `--generate-notes`.
 
-Prerequisites: configure an `NPM_TOKEN` secret in **Settings → Secrets and variables → Actions** (an npm automation token, or a granular token with publish permission on the package); the publishing account must be the npm user owning the package name.
+The alias is not a copy-paste of the package: the installed name is baked into two artifacts DSH reads by name — the client bundle's `window.__ModuleLoader__.load({id})` registration, and the `name:` of the loader row in `cordis.patch.yml`. A bundle registering any id other than its manifest name is rejected by DSH's client-modules, so `scripts/prepare-alias.mjs` stages a copy that rebuilds the bundle under the alias id and renames that row.
+
+Prerequisites: configure an `NPM_TOKEN` secret in **Settings → Secrets and variables → Actions** (an npm automation token, or a granular token with publish permission on the package); the publishing account must own both the `@januory` scope and the `dsh-remote-workspaces` package name.
 
 Equivalent manual flow:
 
@@ -139,6 +133,14 @@ npm login
 
 npm publish --provenance
 
+node scripts/prepare-alias.mjs dsh-remote-workspaces .alias
+
+cd .alias && npm publish --provenance && cd ..
+```
+
+Then tag and push:
+
+```sh
 git tag "v$(node -p \"require('./package.json').version\")"
 
 git push origin --tags

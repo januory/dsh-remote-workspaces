@@ -34,7 +34,7 @@ var React = require('react')
 // whose `schema` parses pass-through JSON (the client `$mount`
 // face rejects `src-json`).
 // ---------------------------------------------------------------------------
-var PACKAGE = 'dsh-remote-workspaces'
+var PACKAGE = '@januory/dsh-remote-workspaces'
 var NAMESPACE = 'remoteWorkspaces'
 
 // A strict codec must carry a `schema` with `parse()` (the client `$mount` face

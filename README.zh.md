@@ -47,16 +47,8 @@ $DSH_HOME/remote-workspaces/
 
 ## 安装
 
-从本仓库在线安装：
-
 ```sh
-dsh plugin --profile web add github:januory/dsh-remote-workspaces
-```
-
-发布到 npm 后，也可以直接安装已发布的包：
-
-```sh
-dsh plugin --profile web add dsh-remote-workspaces
+dsh plugin --profile web add @januory/dsh-remote-workspaces
 ```
 
 从源码安装：
@@ -74,10 +66,10 @@ dsh plugin --profile web add .
 卸载：
 
 ```sh
-dsh plugin --profile web remove dsh-remote-workspaces
+dsh plugin --profile web remove @januory/dsh-remote-workspaces
 ```
 
-> 维护者注：npm 包名现为 `dsh-remote-workspaces`（早期 git 安装时的包名是 `remote-workspaces`）；旧安装请先 `dsh plugin --profile <name> remove remote-workspaces`，再按新名安装。
+> 维护者注：npm 包名现为 `@januory/dsh-remote-workspaces`；非 scoped 的 `dsh-remote-workspaces` 每次发版仍作为别名一起发布，让按旧名安装的用户能继续升级，更早期的 git 安装包名是 `remote-workspaces`。仍装在已弃用旧名下的安装，请先 `dsh plugin --profile <name> remove <旧名>`，再按当前包名安装。
 
 ## 使用
 
@@ -130,9 +122,11 @@ pnpm test:integration
 
 ## 发布（维护者）
 
-发布完全手动触发、**零输入**：版本号直接取自 `package.json`，发布前先在 `main` 上提交改好的 `version`，然后 GitHub Actions → **release** → **Run workflow** 即可。工作流会自动执行：跑单元测试（`npm test`）→ 校验 `v<version>` tag 尚未存在（防止重复发布）→ `npm publish`（带 provenance）→ 打 `v<version>` tag 并推送 → 用 `--generate-notes` 创建 GitHub Release。
+发布完全手动触发、**零输入**：版本号直接取自 `package.json`，发布前先在 `main` 上提交改好的 `version`，然后 GitHub Actions → **release** → **Run workflow** 即可。工作流会自动执行：跑单元测试（`npm test`）→ 校验 `v<version>` tag 尚未存在（防止重复发布）→ `npm publish`（带 provenance）→ 同一版本再以旧的非 scoped 包名 `dsh-remote-workspaces` 发一份，让按旧名安装的用户能继续升级 → 打 `v<version>` tag 并推送 → 用 `--generate-notes` 创建 GitHub Release。
 
-前提：在仓库 **Settings → Secrets and variables → Actions** 中配置名为 `NPM_TOKEN` 的 secret（npm automation token，或对该包有 publish 权限的 granular token）；发布账号须是持有该包名的 npm 用户。
+别名不是原样复制：安装名会被写进两个 DSH 按名字读取的产物——客户端 bundle 的 `window.__ModuleLoader__.load({id})` 注册 id，以及 `cordis.patch.yml` 里 loader 行的 `name:`。注册 id 与包名不一致的 bundle 会被 DSH 的 client-modules 直接拒绝，所以 `scripts/prepare-alias.mjs` 会生成一份副本，用别名 id 重新构建 bundle 并改掉那一行。
+
+前提：在仓库 **Settings → Secrets and variables → Actions** 中配置名为 `NPM_TOKEN` 的 secret（npm automation token，或对该包有 publish 权限的 granular token）；发布账号须同时拥有 `@januory` 作用域与 `dsh-remote-workspaces` 包名的发布权。
 
 等价的手工流程：
 
@@ -141,6 +135,14 @@ npm login
 
 npm publish --provenance
 
+node scripts/prepare-alias.mjs dsh-remote-workspaces .alias
+
+cd .alias && npm publish --provenance && cd ..
+```
+
+然后打 tag 并推送：
+
+```sh
 git tag "v$(node -p \"require('./package.json').version\")"
 
 git push origin --tags

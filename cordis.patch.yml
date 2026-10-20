@@ -22,4 +22,4 @@
 
 - insert:
     - id: dsh-remote-workspaces
-      name: 'dsh-remote-workspaces'
+      name: '@januory/dsh-remote-workspaces'

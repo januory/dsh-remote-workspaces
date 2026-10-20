@@ -128,10 +128,10 @@ const hostDescriptors = hostContribution === undefined ? [] : hostContribution.i
 const clientDescriptors = mounts.length === 0 ? [] : mounts[0].descriptors
 
 check('the host half registers a Remote contribution under the bundle package',
-  hostContribution !== undefined && hostContribution.package === 'dsh-remote-workspaces',
+  hostContribution !== undefined && hostContribution.package === '@januory/dsh-remote-workspaces',
   hostContribution && hostContribution.package)
 check('the client half mounts the same package',
-  mounts.length === 1 && mounts[0].package === 'dsh-remote-workspaces',
+  mounts.length === 1 && mounts[0].package === '@januory/dsh-remote-workspaces',
   JSON.stringify(mounts.map((m) => m.package)))
 check('both halves carry the same 17 endpoints, in the same order',
   hostDescriptors.length === 17 && clientDescriptors.length === 17

@@ -58,6 +58,18 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      # 同一版本再以非 scoped 别名发一份，让按旧包名安装的用户能继续升级。
+      # 包名会被写进两个 DSH 按名字读取的产物（客户端 bundle 的注册 id、
+      # cordis.patch.yml 的 loader 行名），别名包照抄会静默丢掉整个浏览器侧，
+      # 所以这里生成一份改好名字的目录再发布，而不是原地改 package.json 发两次。
+      - name: Publish to npm as dsh-remote-workspaces
+        run: |
+          node scripts/prepare-alias.mjs "dsh-remote-workspaces" "$RUNNER_TEMP/alias"
+          cd "$RUNNER_TEMP/alias"
+          npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Create and push tag
         run: |
           git tag "v${{ steps.version.outputs.version }}"
