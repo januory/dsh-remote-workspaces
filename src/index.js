@@ -4,6 +4,7 @@ import { loadMachines, sanitizeMachine, upsertMachine, removeMachine, machineByI
 import { ensureAnchor } from './anchor.js'
 import { RoutingFileSystem } from './routing-fs.js'
 import { SshShellExecutor } from './shell-exec.js'
+import { bindService } from './adopt-service.js'
 import { registerAnchor, unregisterAnchor, findByCwd, updateAnchorOs } from './registry.js'
 import { applySearchTools } from './search.js'
 import { createShellSessions } from './shell-sessions.js'
@@ -473,8 +474,13 @@ export function apply(ctx) {
     deps.subprocess = sctx.get('subprocess')
     return () => { deps.policy = deps.sandbox = deps.subprocess = undefined }
   })
-  ctx.provide('fs', new RoutingFileSystem(remote))
-  ctx.provide('shell', new SshShellExecutor(remote))
+  // Normally the bundle patch disabled `fs-sandbox`/`bash-sandbox`/`pwsh-sandbox`
+  // and these own the names. When the patch layer did not apply (marketplace
+  // hot-mount, a hand-inserted plugin row, an older installer), the stock
+  // provider is live and `ctx.provide` would abort the whole host; adopt it
+  // instead so routing still works. See ./adopt-service.js.
+  bindService(ctx, 'fs', new RoutingFileSystem(remote))
+  bindService(ctx, 'shell', new SshShellExecutor(remote))
 
   const service = remoteWorkspacesService(remote)
   service.typertRemote = Object.freeze({ service, serviceKey: NAMESPACE, namespace: NAMESPACE })
